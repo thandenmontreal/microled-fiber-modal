@@ -293,7 +293,7 @@ wy.fillStyle='#8b98ac';wy.font='10px system-ui';wy.fillText('Principle there: in
       const sigCD=Math.max(P.Dcd*(Lm/1000)*P.dlam/2.355,0.02);
       const rmsM=dtauM/Math.sqrt(12), rmsC=sigCD;
       const Rb2=P.cdRb;
-      md.fillStyle='#e6edf3';md.font='bold 13px system-ui';md.fillText('1 \u00b7  Modal dispersion \u2014 delay spread and the low-pass it creates',12,16);
+      md.fillStyle='#e6edf3';md.font='bold 13px system-ui';md.fillText('1 \u00b7  Modal dispersion \u2014 h(t), the delay spread, and the low-pass it creates',12,16);
       md.fillStyle='#8b98ac';md.font='10px system-ui';
       md.fillText('ray-traced in n(r) = nco*sqrt(1-2*Delta*(r/a)^alpha).  Step (alpha=99): dtau = NA\u00b2 L/(2 n1 c), h(t) = rect.  Graded (alpha->2): delays equalise, dtau collapses.',12,32);
       const Lx=40,Lw=320,Ly=44,Lh=130;md.strokeStyle='#25324e';md.strokeRect(Lx,Ly,Lw,Lh);
@@ -306,7 +306,19 @@ wy.fillStyle='#8b98ac';wy.font='10px system-ui';wy.fillText('Principle there: in
         for(let i=0;i<_dn.NB;i++){const h=_dn.bins[i]/mxb*(Lh-14);
           const bx=x0+i/_dn.NB*xw, bw=Math.max(xw/_dn.NB,0.7);
           if(bx>=Lx&&bx<=Lx+Lw)md.fillRect(bx,Ly+Lh-4-h,bw,h);}}
-      md.fillStyle='#8b98ac';md.fillText('0',Lx-4,Ly+Lh+12);md.fillText(span.toFixed(0)+' ps',Lx+Lw-34,Ly+Lh+12);
+      /* axis labels: the vertical axis is the share of launched power arriving in that time
+         bin, the horizontal axis is arrival time measured from the fastest ray */
+      md.save();
+      md.translate(Lx-16,Ly+Lh/2);md.rotate(-Math.PI/2);
+      md.fillStyle='#8b98ac';md.font='9.5px system-ui';md.textAlign='center';
+      md.fillText('power per bin',0,0);
+      md.restore();
+      md.textAlign='left';md.font='10px system-ui';md.fillStyle='#8b98ac';
+      md.fillText('0',Lx-4,Ly+Lh+12);
+      md.fillText(span.toFixed(0)+' ps',Lx+Lw-34,Ly+Lh+12);
+      md.textAlign='center';
+      md.fillText('arrival time, from the fastest ray  (ps)',Lx+Lw/2,Ly+Lh+12);
+      md.textAlign='left';
       md.fillStyle='#e5c07b';md.fillText('edge '+(Math.asin(Math.min(NAv,0.99))*180/Math.PI).toFixed(1)+'\u00b0 (5%,=NA)  theta50 '+((P.th50>=90)?'OFL':(P.th50.toFixed(1)+'\u00b0'))+'  alpha '+((P.fbAlpha===undefined?99:P.fbAlpha)>=90?'step':(P.fbAlpha).toFixed(2)),Lx,Ly+Lh+26);
       
       const Rx=432,Rw=282,Ry=44,Rh=130;md.strokeStyle='#25324e';md.strokeRect(Rx,Ry,Rw,Rh);
