@@ -79,8 +79,10 @@ function _modalDensity(NA,alpha,fill,reachM,NB){
       if(num<=0)continue;const sr=Math.sqrt(num);
       Lz+=beta/sr*dr;Tt+=n*n/(C0*sr)*dr;}
     return Lz>0?Tt/Lz:nco/C0;};
-  const thMax=Math.asin(Math.min(NA/nco,0.999)),NR=600,rays=[];
-  for(let i=0;i<NR;i++){const th=(i+0.5)/NR*thMax,t=delayOf(th);
+  /* 600 rays over 90 bins leaves about one ray per bin in the tail, which makes the
+     last bin jump around by 10%. 2400 brings it to ~4 per bin and the tail reads clean.
+     spread, rms and |H| are unchanged to four digits - only the drawn shape improves. */
+  const thMax=Math.asin(Math.min(NA/nco,0.999)),NR=2400,rays=[];  for(let i=0;i<NR;i++){const th=(i+0.5)/NR*thMax,t=delayOf(th);
     if(t===null)continue;
     const _sg=(fill*Math.PI/180)/1.17741;const w=Math.sin(th)*Math.cos(th)*((fill>=90)?1:Math.exp(-(th*th)/(2*_sg*_sg)));
     rays.push({t,w});}
