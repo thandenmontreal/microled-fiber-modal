@@ -47,23 +47,244 @@ select{background:#0d1730;color:var(--ink);border:1px solid var(--grid);border-r
 </style></head>
 <body>
 <header>
-  <h1>LED over Multimode Fiber</h1><span class="pill">modal dispersion explorer &middot; single file &middot; offline</span>
-  <div style="font-size:12.5px;color:#9fb0c8;margin:6px 0 2px;max-width:980px;line-height:1.45">One released module of a larger end-to-end micro-LED link simulator I built (waveform-level BER engine, chromatic + modal dispersion, coupling optics, crosstalk, and receiver studies &mdash; calibrated against MOSAIC SIGCOMM&#39;25 and published FDTD results). This page opens the fiber-propagation core; the receiver-architecture modules are not published. <a href="https://github.com/thandenmontreal/microled-fiber-modal" style="color:#8bb7f0">Methods &amp; validation notes</a></div>
-  <div class="tabs"><div class="trow">
-    <div class="tab on" data-t="cdlp">Modal dispersion</div>
-  </div></div>
+  <h1>MicroLED Sim Lab</h1><span class="pill">offline · no install</span><span class="pill" title="LED model in the main link path: rise is instantaneous; fall is 75% instantaneous plus a 25% tail with a fixed time constant ledTailPs (default 250 ps). This is a phenomenological model calibrated to measured BER at 2 to 11 Gb/s (MOSAIC Fig 12, HotI Fig 8), not a device-physics model. The J-dependent bandwidth table (NCSU slide 13, E-O converted to E-E) feeds the rise/fall asymmetry and the SSBI panel. The ABC rate-equation physics is documented in MicroLED_Physics.pdf." style="margin-left:6px;cursor:help">LED model: calibrated &mdash; hover</span><select id="preset" style="margin-left:6px"><option value="">— preset —</option><option value="ekit26">eKit 1Tbps August 2026 &mdash; end-to-end</option><option value="mosaic">2G / 20 m imaging fiber (MOSAIC SIGCOMM&#39;25 Fig 12)</option><option value="hoti">4G over 20 m OM3 (HotI Aug25 Fig 8)</option></select>
+  <div class="tabs"><div class="trow"><div class="tab on" data-t="cdpk">End-to-end link</div></div></div>
 </header>
 <main><div class="wrap">
   <div class="panel" id="ctrls"></div>
   <div><div id="view"></div></div>
 </div></main>
+
 <script>
-const P={reach:20, Rb:2, cdRb:2, dispSub:1, fibNA:0.2, fbAlpha:99, fbCoreR:25, fbClad:12, fbLam:450, th50:5.5, dlam:16, Dcd:450};
+/* MicroLED end-to-end link simulator — single-tab build.
+   Extracted from the MicroLED Sim Lab (v340 engine).
+   Shared-helper block (parameter defaults, slider, diskOverlap, heatRGB) restored from v336. */
+
+/* µLED L-I (papers): P = kLI * I^nLI (uW, I in mA). No threshold; sub-linear from droop.
+   Calibrated to 80uW @ 1.5mA (PTL2025/HotI2025 Fig4). nLI<1 = droop steepness. */
+function liP(I,nLI){const k=80/Math.pow(1.5,nLI);return k*Math.pow(Math.max(I,0),nLI);}
+const P={ledTailPs:250, pmSub:0, rdThr:1, rdLight:1, r3Yaw:28, r3Pit:18, r3Rays:14, r3Zoom:1, r3Len:2, r3Show:1, Rb:4,ER:6.5,ledBW:3,rxBW:3,dlam:16,reach:5,Dcd:450,snr:22,txsnr:40,ledTail:0.25,ledTailUI:1.0,peak:0,taps:1,sps:12,Nsym:2200,xt:-22,K:6,cmFrac:0.8,cmrr:25,irn:5,Prx:-12, R:0.33,inA:1,M:10,F:2, J:1000,Tc:200,tnr:2.0,Bn:0.8, Ibias:2.0,Iswing:3.0,nLI:0.75,tgain:40,apdM:1,aging:15,Ttel:45,fleetSpread:25,asym:2.0,txpk:3,rxpk:0,peakCost:0.3, oside:'rx',arr:'2d',collim:70,trench:3.0,pitchXt:50,thermXt:0, cfg:'1pd',pdD:30,lensD:50,dtiRefl:55,dtiH:0,pdGap:4,aspect:2,fiberCore:50,lensGap:0,nbr:6,txCup:60,emD:6,fiberNA:0.22, txOff:0, thOut:12, sreach:5, xtk:3.5, nAgg:6, qtgt:5.2,dbiB:0, cdRb:4, zStand:30, inPitch:20, dfeTap:100, dfeTau:0.15, dfeSkew:0, fibNA:0.2, linkNA:0.2, dfe1:0, fbAlpha:99, fbCoreR:25, fbClad:12, fbNA:0.2, fbLam:430, fbLen:5, fbL:3, fbM:1, lutOn:10, lutW:1, lutRx:0, lutWx:1, rxDet:0, pdGap2:4, cmFrac:0.8, cmrr:25, irnFc:12, rxDet:0, thrOpt:0, pLed:80, ledSlow:0.35, ledArea:28, fibAtt:0.06, prxAuto:1, th50:5.5, dispSub:0, eqSub:0};
+function slider(key,label,min,max,step){return `<div class="ctl"><label>${label}<b id="v_${key}">${P[key]}</b></label><input type="range" id="s_${key}" min="${min}" max="${max}" step="${step}" value="${P[key]}"></div>`;}
+
+function telem(aging,T,bias,Rb,ledBW0){
+  // 1st-order TX telemetry drift: ER/VECP/eye-margin vs aging (WPE droop), junction temp, bias. Phenomenological.
+  const lifeK=50, ER0=7, VECP0=0.5;                       // rated life 50kh, fresh ER 7dB
+  const tFac=1-0.005*(T-25);                              // efficiency vs temp
+  const bFac=Math.min(1.2,0.6+0.4*(bias/2));              // bias raises OMA, saturating
+  const OMArel=Math.max(0.15,(1-0.35*(aging/lifeK))*tFac*bFac);   // relative OMA (aging droop + temp + bias)
+  const ER=ER0*OMArel;                                    // ER tracks OMA
+  const ledBWeff=ledBW0*(1-0.004*(T-25))*Math.min(1.3,0.7+0.3*(bias/2));  // LED slower when hot
+  const isi=Math.pow(Rb/(6.5*Math.max(ledBWeff,0.3)),2);  // eye closure from ISI (assumes nominal peaking)
+  const VECP=VECP0+4*isi+2.2*(1-OMArel);                  // vertical eye closure penalty (dB)
+  const eyeH=100*OMArel, eyeW=100*Math.max(0,1-1.2*isi);  // relative eye height/width (%)
+  const ERspec=3, VECPspec=5, eyeSpec=35;
+  const mER=(ER-ERspec)/(ER0-ERspec), mV=(VECPspec-VECP)/(VECPspec-VECP0), mE=(Math.min(eyeH,eyeW)-eyeSpec)/(100-eyeSpec);
+  const health=100*Math.max(0,Math.min(1,Math.min(mER,mV,mE)));
+  return {ER,VECP,eyeH,eyeW,health,ledBWeff};
+}
+const CDNOTE='<b>CD, spectrum, eye and reach in one view.</b> Chromatic dispersion here is an <b>incoherent linear low-pass</b> (verified against a field CD-transfer + square-law sim, correlation 1.0000 &mdash; no fading nulls). The <b>spectrum</b> panel shows it: the Tx signal rolls off at HF after CD (red), and <b>analog peaking (CTLE)</b> boosts HF back (blue). Because the channel is linear a CTLE response inverts it &mdash; this is <b>continuous analog peaking</b>, not a tapped-delay FFE. Walk-off Δτ = D·L·Δλ (D≈450 ps/nm·km at blue); magnitude calibrated to Avicena <b>Fig 8</b> (30 m @ 3.2 Gbaud, 10 nm → Δτ/UI≈0.43). The <b>eye</b> is the same signal after CD+peaking with RX noise; <b>BER-vs-reach</b> compares no-peaking vs analog peaking against the <b>cross-channel-ECC pre-threshold (~1e-7)</b> &mdash; spatial XOR parity across lanes (pre ~1e-7 &rarr; post ~1e-12), not KP4&#39;s 2e-4. µLED gain is low so raw BER must already be good; telemetry that flags a failed lane turns error-correction into erasure-correction, cutting both BER and the redundancy overhead. Grouping across the whole array (hundreds of lanes) keeps overhead to a <b>few %</b> (sub-1% for pure erasure/spare) &mdash; but a larger codeword needs a <b>better raw BER</b> (pre-threshold drops toward ~1e-8), which is why µLED links target 1e-9 to 1e-12 raw. Reach lever is <b>narrower Δλ</b> (CD linear in Δλ), not just more peaking &mdash; peaking is bounded by the matched-filter limit.';
+const CDLPNOTE='<b>Chromatic dispersion as a low-pass filter (incoherent source).</b> Each wavelength travels at its own group velocity, so it arrives with a wavelength-dependent delay <b>τ(λ) = D·L·(λ−λ₀)</b>. Because an LED is <b>incoherent</b>, the detected intensity is the sum of these delayed copies weighted by the spectrum — so the intensity impulse response is just the spectrum re-mapped to time: <b>h(t) = S(λ₀ + t/DL) / |DL|</b>, RMS width <b>σ_t = D·L·σ_λ</b> (FWHM spread Δt = D·L·Δλ). Its transform is a <b>smooth, positive low-pass</b>; for a Gaussian spectrum <b>|H(f)| = exp(−(2πf·σ_t)²/2)</b>, with <b>f₃dB ≈ 0.13/σ_t</b> (σ_t in ns → GHz). Because intensities add (not fields), H(f) has <b>no nulls</b> — it is monotonic and invertible, so analog peaking can flatten it: a <b>SOFT limit</b>, bounded only by SNR and swing (the required boost grows exponentially with dispersion). A <b>coherent</b> source beats field-wise and produces <b>power-fading nulls</b> where H(f)=0 — those cannot be equalized (a <b>HARD limit</b>). This is why a broadband µLED turns CD into an easy, invertible roll-off — and why reach in the CD-limited regime is set by the electronics (SNR + swing), until modal dispersion (also null-producing) takes over. First-order Gaussian model.';
+const TXRXNOTE='<b>Co-optimizing TX pre-emphasis + RX peaking.</b> Real links split the equalization across both ends &mdash; the chart shows no-EQ, TX-only, RX-only, and <b>TX+RX</b> together. Each equalizer has a <b>convex cost</b>: <b>TX pre-emph</b> flattens before the channel/noise (no noise coloring) but spends <b>OMA</b> (modelled as <b>0.5 dB SNR per dB of peaking</b>, from peak-limited drive; the ER penalty tracks it <b>linearly</b> (ER_dB drops ~1:1 with OMA loss, matching hardware experience) &mdash; push it too far and it over-equalizes and collapses the eye (watch TX-only die at high setting). <b>RX in-TIA peaking</b> costs no OMA but colors noise toward the matched-filter bound. Because both costs are convex, the optimum is an <b>interior split</b>, not a corner &mdash; a moderate TX pre-emph handling the bulk plus a light RX peaking mopping up the residual beats maxing either alone. Tune both sliders and watch the <b>TX+RX</b> curve reach furthest. The <b>red line is the cross-channel-ECC limit</b> (pre ~1e-7 &rarr; post ~1e-12; <b>not</b> KP4&#39;s 2e-4 &mdash; µLED uses spatial XOR parity across lanes, not RS-FEC in a SerDes): below it the link is dead no matter the EQ &mdash; at severe CD everything crosses under it, so the real levers there are <b>narrower Δλ</b> (cut the walk-off at the source) or a <b>nonlinear DFE</b> (beats the linear bound), not more linear peaking.';
+const RXCOLNOTE='<b>Fill factor</b> = fraction of the beam\'s optical power that lands on the PD = overlap(beam, PD) / beam area (≈ (PD/beam)² when the PD is smaller than the beam). <b>Coupling loss (dB) = −10·log10(fill factor)</b> — e.g. fill 50% → 3 dB, 25% → 6 dB, 10% → 10 dB. Here a TIR ±12° lens sits a fixed 30 µm above the PD, so beam Ø = D_lens + 2·30·tan(θ), where θ is set by etendue (A_lens·sin²θ = const, so a smaller lens forces a WIDER output angle). Shrinking the lens does not keep shrinking the beam — there is an etendue-optimal lens size that minimises the beam (maximises fill); too big or too small both hurt. Total fill also includes the RX lens capture (~90% of the fiber-NA output — easier than the emitter Lambertian, so higher than TX) and a cover factor (the lens must be ≥ the fiber core to gather all of it). A neighbour lane\'s beam spilling onto this PD is <b>optical crosstalk</b> (summed over N neighbours; 2-D arrays have 4-6). <b>DTI walls do double duty:</b> taller, more reflective walls funnel rim light onto the own PD (fill up) and reflect the neighbour spill back into its own lane (crosstalk down) — both scale with reflectivity × height, bounded by wall reflectivity and etendue. Lenses are packed edge-to-edge so pitch = lens size (always adjacent); each PD sits under a lens (PD ≤ lens). In 2-PD mode the pair pitch = PD + gap (adjustable); the lens is forced ≥ 2·PD + gap so the pair fits under it. This gap is the matching-critical dimension for the differential front-end. Find optimum sweeps PD/gap/DTI and lens (bounded 25-50 µm, i.e. realistic fibre pitch) for max fill with crosstalk below the chosen target. Lens-to-lens gap models the array <b>fill factor</b> (dead zone between adjacent microlenses): a larger gap pushes neighbour beams farther apart so <b>crosstalk falls</b>, but it <b>lowers lane density</b> — it does not change a lane\'s own collection. First-order geometry, not a ray-trace. <b>SPIE anchor (Song et al., FDTD):</b> <b>lateral offset</b> (their term: in-plane misalignment between the &micro;LED and its fiber core) shows a plateau then gradual roll-off, tolerance scaling with core size &mdash; the offset knob here reproduces that shape from disk overlap (normalized geometry, NOT their absolute %: their regime is lens-less butt coupling at &micro;m <b>gap distance</b> on 3-9&micro;m cores; our standoff sits after the TIR collimator, so only the shape transfers and their gap-distance curve is deliberately NOT imported). Adhesive filling (their Strategy 3) is omitted: at our polymer-1.5/silica-1.465 interfaces it is worth only ~0.33 dB per end, unlike their GaN-to-air case.';
+const TXLAUNCHNOTE='<b>TX launch with a TIR &plusmn;12&deg; microlens on the emitter.</b> The lens is etendue-matched to the emitter: D_lens = D_emitter / sin(12&deg;) (~4.8&times; the emitter, so a 6&micro;m emitter needs only a ~29&micro;m lens). The &plusmn;12&deg; beam grows to D_lens + 2&middot;30&middot;tan(12&deg;) at the fiber face; if it fits within the fiber core, spatial coupling is ~100%. <b>Launch = spatial fit &times; lens capture (~85% of the Lambertian emission) &times; angular acceptance (fiber NA vs &plusmn;12&deg;).</b> Because the emitter is small (6&micro;m = tiny etendue) and the fiber is large (50&micro;m), <b>TX is etendue-EASY</b> &mdash; launch is high (~1 dB), the opposite of RX collection (big fiber &rarr; small PD = hard). This is exactly why Avicena chose a small ~6&micro;m emitter: small etendue couples efficiently; large devices would not. First-order geometry, not a ray-trace. <b>SPIE anchor (Song et al., FDTD):</b> <b>lateral offset</b> (their term: in-plane misalignment between the &micro;LED and its fiber core) shows a plateau then gradual roll-off, tolerance scaling with core size &mdash; the offset knob here reproduces that shape from disk overlap (normalized geometry, NOT their absolute %: their regime is lens-less butt coupling at &micro;m <b>gap distance</b> on 3-9&micro;m cores; our standoff sits after the TIR collimator, so only the shape transfers and their gap-distance curve is deliberately NOT imported). Adhesive filling (their Strategy 3) is omitted: at our polymer-1.5/silica-1.465 interfaces it is worth only ~0.33 dB per end, unlike their GaN-to-air case.';
+const ETNOTE='<b>Etendue G = A·Ω (area × solid angle) is conserved</b> in any passive optic &mdash; it can only stay equal or grow, never shrink. Ω uses <b>sin²θ</b> because a beam spreads in two axes (3D): a cone of half-angle θ has Ω ≈ π·sin²θ steradian. So shrinking the output <b>angle</b> (Ω ÷N) forces the <b>aperture area</b> to grow ×N &mdash; that is why a small Lambertian µLED needs an exit aperture ~23× its emitter area at ±12°, and why <b>fill factor &lt; 100% is by design</b>, not a lens defect. <b>This is NOT energy conservation:</b> even with zero loss, etendue forbids squeezing a wide-angle source onto a tiny spot at a small angle &mdash; it behaves like entropy (2nd law), not power (1st law). A laser has very low etendue at the source (coherent) so it focuses tight and travels far; a Lambertian LED cannot be made to act like one by any passive optic.';
+function ovE(a,b,cx,cy,R,rx,ry){var N=28,c=0;for(var i=0;i<N;i++){var x=cx-a+2*a*(i+0.5)/N;for(var j=0;j<N;j++){var y=cy-b+2*b*(j+0.5)/N,dx=(x-cx)/a,dy=(y-cy)/b;if(dx*dx+dy*dy<=1){var ex=x-rx,ey=y-ry;if(ex*ex+ey*ey<=R*R)c++;}}}return c*(4*a*b)/(N*N);}
+function diskOverlap(R,r,dd){if(dd>=R+r)return 0;if(dd<=Math.abs(R-r))return Math.PI*Math.min(R,r)*Math.min(R,r);const a=(dd*dd+R*R-r*r)/(2*dd),b=dd-a;return R*R*Math.acos(Math.max(-1,Math.min(1,a/R)))-a*Math.sqrt(Math.max(R*R-a*a,0))+r*r*Math.acos(Math.max(-1,Math.min(1,b/r)))-b*Math.sqrt(Math.max(r*r-b*b,0));}
+function heatRGB(t){t=Math.max(0,Math.min(1,t));const st=[[0,0,90],[0,0,255],[0,153,255],[0,255,255],[102,255,102],[255,255,0],[255,128,0],[204,0,0]];const seg=t*(st.length-1),i=Math.min(st.length-2,Math.floor(seg)),fr=seg-i,a=st[i],b=st[i+1];return [Math.round(a[0]+(b[0]-a[0])*fr),Math.round(a[1]+(b[1]-a[1])*fr),Math.round(a[2]+(b[2]-a[2])*fr)];}
+function heatColor(t){t=Math.max(0,Math.min(1,t));const st=[[8,10,35],[25,55,170],[0,190,210],[40,215,70],[245,220,45],[240,45,30]];const seg=t*(st.length-1),i=Math.min(st.length-2,Math.floor(seg)),fr=seg-i,a=st[i],b=st[i+1];return 'rgb('+Math.round(a[0]+(b[0]-a[0])*fr)+','+Math.round(a[1]+(b[1]-a[1])*fr)+','+Math.round(a[2]+(b[2]-a[2])*fr)+')';}
+const TAU=Math.PI*2;
+function mulberry(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function randn(rng){let u=0,v=0;while(u===0)u=rng();while(v===0)v=rng();return Math.sqrt(-2*Math.log(u))*Math.cos(TAU*v);}
+function erfc(x){const z=Math.abs(x),t=1/(1+0.5*z);const r=t*Math.exp(-z*z-1.26551223+t*(1.00002368+t*(.37409196+t*(.09678418+t*(-.18628806+t*(.27886807+t*(-1.13520398+t*(1.48851587+t*(-.82215223+t*.17087277)))))))));return x>=0?r:2-r;}
+function berNRZ(Q){return Q<=0?0.5:0.5*erfc(Q/Math.SQRT2);}
+function onepole(x,fc,dt){const a=Math.exp(-dt/(1000/(TAU*fc)));const y=new Float64Array(x.length);let p=x[0];for(let i=0;i<x.length;i++){p=a*p+(1-a)*x[i];y[i]=p;}return y;}
+function onepoleZP(x,fc,dt){let y=onepole(x,fc,dt);const a=Math.exp(-dt/(1000/(TAU*fc)));let q=y[y.length-1];for(let i=y.length-1;i>=0;i--){q=a*q+(1-a)*y[i];y[i]=q;}return y;}
+/* µLED slow roll-off (Avicena PTL 2025 / HotI 2025 Fig5-6): LED rolls off MUCH slower than a 6dB/oct
+   single pole -> usable modulation far above the 3dB point. Model = dominant pole at f3 + weak fast
+   feedthrough path at m*f3 that lifts the high-freq tail. b,m tuned so 10-11Gb/s opens on a ~2GHz LED. */
+function ledFilt(x,f3,dt){const b=0.30,m=8;const s1=onepole(x,f3,dt),s2=onepole(x,f3*m,dt);const y=new Float64Array(x.length);for(let i=0;i<x.length;i++)y[i]=(1-b)*s1[i]+b*s2[i];return y;}
+function gaussFilt(x,sig){if(sig<0.3)return x.slice();const R=Math.ceil(sig*4),k=[];let s=0;for(let i=-R;i<=R;i++){const w=Math.exp(-0.5*(i/sig)**2);k.push(w);s+=w;}for(let i=0;i<k.length;i++)k[i]/=s;const y=new Float64Array(x.length);for(let n=0;n<x.length;n++){let acc=0;for(let j=-R;j<=R;j++){const m=n+j;if(m>=0&&m<x.length)acc+=k[j+R]*x[m];}y[n]=acc;}return y;}
+function mean(a){let s=0;for(let i=0;i<a.length;i++)s+=a[i];return s/a.length;}
+function std(a){const m=mean(a);let s=0;for(let i=0;i<a.length;i++)s+=(a[i]-m)*(a[i]-m);return Math.sqrt(s/a.length);}
+function csprToBeta(cspr){return 1/(2*Math.pow(10,cspr/20));}
+
 function mkCanvas(id,h,wOpt){const c=document.createElement('canvas');c.id=id;const dpr=window.devicePixelRatio||1;const w=wOpt||760;c.width=w*dpr;c.height=h*dpr;c.style.height=h+'px';c.getContext('2d').scale(dpr,dpr);c._w=w;c._h=h;return c;}
 function clear(ctx,c){ctx.clearRect(0,0,c._w,c._h);}
+function axes(ctx,c,pad,xlab,ylab,title){ctx.strokeStyle='#25324e';ctx.lineWidth=1;ctx.strokeRect(pad.l,pad.t,c._w-pad.l-pad.r,c._h-pad.t-pad.b);if(title){ctx.fillStyle='#cbd5e1';ctx.font='12px system-ui';ctx.fillText(title,pad.l,pad.t-6);}ctx.fillStyle='#8b98ac';ctx.font='11px system-ui';if(xlab)ctx.fillText(xlab,(c._w)/2-30,c._h-6);if(ylab){ctx.save();ctx.translate(11,(c._h)/2+20);ctx.rotate(-Math.PI/2);ctx.fillText(ylab,0,0);ctx.restore();}}
+function linePlot(ctx,c,series,xr,yr,pad,ylog){
+  const X=v=>pad.l+(v-xr[0])/(xr[1]-xr[0])*(c._w-pad.l-pad.r);
+  const tY=ylog?(v=>Math.log10(Math.max(v,1e-20))):(v=>v);const y0=tY(yr[0]),y1=tY(yr[1]);
+  const Y=v=>pad.t+(1-(tY(v)-y0)/(y1-y0))*(c._h-pad.t-pad.b);
+  ctx.strokeStyle='#16223c';ctx.lineWidth=1;ctx.fillStyle='#66748e';ctx.font='10px system-ui';
+  const nx=5;for(let i=0;i<=nx;i++){const xv=xr[0]+(xr[1]-xr[0])*i/nx,px=X(xv);ctx.beginPath();ctx.moveTo(px,pad.t);ctx.lineTo(px,c._h-pad.b);ctx.stroke();ctx.fillText(xv.toFixed(Math.abs(xv)<10?1:0),px-8,c._h-pad.b+12);}
+  ctx.textAlign='right';if(ylog){for(let e=Math.ceil(y0);e<=Math.floor(y1);e++){const py=Y(Math.pow(10,e));ctx.beginPath();ctx.moveTo(pad.l,py);ctx.lineTo(c._w-pad.r,py);ctx.stroke();ctx.fillText('1e'+e,pad.l-5,py+3);}}
+  else{const ny=4;for(let i=0;i<=ny;i++){const yv=yr[0]+(yr[1]-yr[0])*i/ny,py=Y(yv);ctx.beginPath();ctx.moveTo(pad.l,py);ctx.lineTo(c._w-pad.r,py);ctx.stroke();ctx.fillText(yv.toFixed(1),pad.l-5,py+3);}}ctx.textAlign='left';
+  for(const s of series){ctx.strokeStyle=s.c;ctx.lineWidth=s.w||2;ctx.beginPath();let started=false;for(const pt of s.d){const yv=pt[1];if(yv==null||!isFinite(tY(yv))){started=false;continue;}const px=X(pt[0]),py=Y(yv);if(!started){ctx.moveTo(px,py);started=true;}else ctx.lineTo(px,py);}ctx.stroke();}
+  const _lg=series.filter(s=>s.name);if(_lg.length){ctx.font='10px system-ui';ctx.textAlign='left';let _mw=0;for(const s of _lg)_mw=Math.max(_mw,ctx.measureText(s.name).width);const _bw=_mw+20,_bx=c._w-pad.r-_bw-2,_by=pad.t+2;ctx.fillStyle='rgba(13,17,23,0.62)';ctx.fillRect(_bx,_by,_bw,_lg.length*14+4);let ly=_by+12;for(const s of _lg){ctx.fillStyle=s.c;ctx.fillRect(_bx+4,ly-7,9,3);ctx.fillStyle='#cbd5e1';ctx.fillText(s.name,_bx+17,ly-2);ly+=14;}}
+}
+function piePlot(ctx,c,items,title){
+  clear(ctx,c);const H=c._h;const tot=items.reduce((s,i)=>s+i[1],0)||1;
+  ctx.fillStyle='#cbd5e1';ctx.font='12px system-ui';if(title)ctx.fillText(title,12,16);
+  const cx=92, cy=H/2+10, r=Math.min(72,H/2-16);let a0=-Math.PI/2;
+  for(const it of items){const a1=a0+(it[1]/tot)*2*Math.PI;ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,r,a0,a1);ctx.closePath();ctx.fillStyle=it[2];ctx.fill();ctx.strokeStyle='#0d1117';ctx.lineWidth=1;ctx.stroke();a0=a1;}
+  const sorted=items.slice().sort((p,q)=>q[1]-p[1]);ctx.font='11px system-ui';
+  const perCol=Math.ceil(sorted.length/2), colX=[182,468];
+  sorted.forEach((it,i)=>{const col=Math.floor(i/perCol), row=i%perCol, x=colX[col], y=30+row*22, pct=100*it[1]/tot;ctx.fillStyle=it[2];ctx.fillRect(x,y-9,11,11);ctx.fillStyle='#cbd5e1';ctx.fillText(it[0]+'  '+pct.toFixed(0)+'%',x+17,y);});
+}
+/* eyeHeat: shared eye density heatmap (same pipeline as tab 1): vector lineTo with 'lighter' (additive count), gaussian blur, p99 normalize, gamma 1.5 -> JET, bilinear upscale */
+function eyeHeat(ctx,x0,y0,w,h,tracesFn){
+  const OW=Math.max(8,Math.round(w)),OH=Math.max(8,Math.round(h)),oc=document.createElement('canvas');oc.width=OW;oc.height=OH;const o=oc.getContext('2d');
+  o.fillStyle='#000';o.fillRect(0,0,OW,OH);o.globalCompositeOperation='lighter';o.strokeStyle='rgb(3,3,3)';o.lineWidth=1;o.lineJoin='round';o.lineCap='round';
+  tracesFn((pts)=>{if(pts.length<2)return;o.beginPath();o.moveTo(pts[0][0]*OW,pts[0][1]*OH);for(let i=1;i<pts.length;i++)o.lineTo(pts[i][0]*OW,pts[i][1]*OH);o.stroke();});
+  o.globalCompositeOperation='source-over';
+  const im=o.getImageData(0,0,OW,OH),px=im.data,N=OW*OH,dn=new Float32Array(N);for(let k=0;k<N;k++)dn[k]=px[k*4];
+  const gk=[],gr=4;let gs=0;for(let q=-gr;q<=gr;q++){const wq=Math.exp(-q*q/(2*1.6*1.6));gk.push(wq);gs+=wq;}for(let q=0;q<gk.length;q++)gk[q]/=gs;
+  const t1=new Float32Array(N),bl=new Float32Array(N);
+  for(let y=0;y<OH;y++)for(let x=0;x<OW;x++){let sm=0;for(let q=-gr;q<=gr;q++){const xx=Math.min(OW-1,Math.max(0,x+q));sm+=dn[y*OW+xx]*gk[q+gr];}t1[y*OW+x]=sm;}
+  for(let y=0;y<OH;y++)for(let x=0;x<OW;x++){let sm=0;for(let q=-gr;q<=gr;q++){const yy=Math.min(OH-1,Math.max(0,y+q));sm+=t1[yy*OW+x]*gk[q+gr];}bl[y*OW+x]=sm;}
+  const lit=[];for(let k=0;k<N;k++)if(bl[k]>0.5)lit.push(bl[k]);lit.sort((a,b)=>a-b);const nrm=lit.length?lit[Math.floor(lit.length*0.99)]:1;
+  for(let k=0;k<N;k++){const oi=k*4,t=Math.min(1,bl[k]/nrm);if(t<0.02){px[oi]=8;px[oi+1]=12;px[oi+2]=40;px[oi+3]=255;continue;}const cc=heatRGB(Math.pow(t,1.5));px[oi]=cc[0];px[oi+1]=cc[1];px[oi+2]=cc[2];px[oi+3]=255;}
+  o.putImageData(im,0,0);ctx.imageSmoothingEnabled=true;ctx.drawImage(oc,x0,y0,w,h);
+}
+function eyePlot(ctx,c,sig,sps,phase,pad,col,title,yr){
+  clear(ctx,c);axes(ctx,c,pad,'2 UI','amp',title||'Eye');
+  /* yr=[ymin,ymax] optional FIXED Y frame (absolute units, no mean-centering) - sliders no longer rescale; omit yr -> legacy autoscale */
+  let m,lo,hi;
+  if(yr){m=0;lo=yr[0];hi=yr[1];}
+  else{m=mean(sig);lo=1e9;hi=-1e9;for(let i=0;i<sig.length;i++){const v=sig[i]-m;if(v<lo)lo=v;if(v>hi)hi=v;}}
+  const pw=c._w-pad.l-pad.r,ph=c._h-pad.t-pad.b;
+  const nsym=Math.min(600,Math.floor((sig.length-phase-2*sps)/sps)),step=Math.max(1,Math.floor(Math.floor((sig.length-phase-2*sps)/sps)/nsym));
+  eyeHeat(ctx,pad.l,pad.t,pw,ph,(emit)=>{for(let t=0;t<nsym;t++){const st=phase+t*step*sps;if(st+2*sps>sig.length)break;const pts=[];for(let k=0;k<2*sps;k++){pts.push([k/(2*sps-1),1-(sig[st+k]-m-lo)/(hi-lo+1e-9)]);}emit(pts);}});
+}
+
 function met(k,v){return `<div class="m"><div class="k">${k}</div><div class="v">${v}</div></div>`;}
-function slider(key,label,min,max,step){return `<div class="ctl"><label>${label}<b id="v_${key}">${P[key]}</b></label><input type="range" id="s_${key}" min="${min}" max="${max}" step="${step}" value="${P[key]}"></div>`;}
-var _mkCache={};
+function fmtber(b){return b<1e-12?'<1e-12':b.toExponential(1);}
+function bestPhaseQ(sig,bits,sps,Nsym){let bQ=-1,bp=0;for(let ph=0;ph<sps;ph++){let m1=0,m0=0,n1=0,n0=0;for(let t=2;t<Nsym-2;t++){const v=sig[ph+t*sps];if(bits[t]){m1+=v;n1++;}else{m0+=v;n0++;}}if(n1<10||n0<10)continue;m1/=n1;m0/=n0;let s1=0,s0=0;for(let t=2;t<Nsym-2;t++){const v=sig[ph+t*sps];if(bits[t])s1+=(v-m1)**2;else s0+=(v-m0)**2;}const Q=(m1-m0)/(Math.sqrt(s1/n1)+Math.sqrt(s0/n0)+1e-12);if(Q>bQ){bQ=Q;bp=ph;}}return{Q:bQ,ph:bp};}
+
+/* SSBI + CD  (NRZ vs PAM4, FFE-on, cancel vs no-cancel) */
+function nrzSSBI(p){
+  const {Rb,ledBW,rxBW,reach,Dcd,dlam,snr,mode,sps,Nsym,peak}=p;
+  const mod='nrz';                                   // Avicena: NRZ only
+  const ERlin=Math.pow(10,(p.ER!==undefined?p.ER:6.5)/10);
+  const cspr=(p.cspr!==undefined)?p.cspr:10*Math.log10(Math.pow((ERlin+1)/Math.max(ERlin-1,1e-6),2)); // CSPR from ER
+  const lv = (mod==='pam4')? [-3,-1,1,3].map(v=>v/Math.sqrt(5)) : [-1,1];
+  const rng=mulberry(2024);const idx=new Int32Array(Nsym);for(let i=0;i<Nsym;i++)idx[i]=(rng()*lv.length)|0;
+  const N=Nsym*sps;const dt=(1000/Rb)/sps;
+  const C=Math.sqrt(Math.pow(10,cspr/10));const beta=1/(2*C);
+  const s=new Float64Array(N);for(let i=0;i<Nsym;i++){const v=lv[idx[i]];for(let k=0;k<sps;k++)s[i*sps+k]=v;}
+  const tau=Dcd*(reach/1000)*dlam;const sig=(tau/2.355)/dt;
+  let sf=gaussFilt(s,sig);sf=ledFilt(sf,ledBW,dt);
+  // incoherence washout: μLED emits directly-modulated INTENSITY from an incoherent carrier (τc~fs),
+  // so the sf² self-beat (SSBI) averages out. gamma = 1/(1+Δν·T_UI) = 1/(1+UI/τc). Coherent laser: gamma=1.
+  const dnu=3e8*Math.max(dlam,1e-4)*1e-9/Math.pow(430e-9,2), TUI=1/(Rb*1e9), gamma=(p.src==='coh')?1:1/(1+dnu*TUI);
+  const inten=new Float64Array(N);for(let i=0;i<N;i++)inten[i]=2*C*sf[i]+gamma*sf[i]*sf[i];
+  let r=onepoleZP(inten,rxBW,dt);const rm=mean(r);for(let i=0;i<N;i++)r[i]-=rm;
+  if(peak>0){const g=Math.pow(10,peak/20)-1;const rl=onepole(r,Rb/2,dt);for(let i=0;i<N;i++)r[i]=r[i]+g*(r[i]-rl[i]);} // analog peaking
+  const ac=std(r);const npw=ac*ac/Math.pow(10,snr/10);for(let i=0;i<N;i++)r[i]+=Math.sqrt(npw)*randn(rng);
+  function cancel(){let lin=new Float64Array(N);for(let i=0;i<N;i++)lin[i]=r[i]/(2*C);
+    if(mode!=='none'){for(let it=0;it<6;it++){const sq=new Float64Array(N);for(let i=0;i<N;i++)sq[i]=lin[i]*lin[i];
+      const ss=(mode==='aware')?onepoleZP(sq,rxBW,dt):sq;const sm=mean(ss);
+      for(let i=0;i<N;i++)lin[i]=0.5*lin[i]+0.5*((r[i]-gamma*beta*2*C*(ss[i]-sm))/(2*C));}}
+    return lin;}
+  function ffeSNR(x){const M=15,half=7;let bp=0,bv=-1;
+    for(let ph=0;ph<sps;ph++){let m=0,c=0;for(let t=2;t<Nsym-2;t++){m+=x[ph+t*sps];c++;}m/=c;let v=0;for(let t=2;t<Nsym-2;t++)v+=(x[ph+t*sps]-m)**2;if(v>bv){bv=v;bp=ph;}}
+    const samp=new Float64Array(Nsym);for(let t=0;t<Nsym;t++)samp[t]=x[bp+t*sps];const sm=mean(samp),ss2=std(samp);for(let t=0;t<Nsym;t++)samp[t]=(samp[t]-sm)/(ss2+1e-9);
+    const w=new Float64Array(M);w[half]=1;const mu=0.008;
+    for(let pass=0;pass<20;pass++)for(let t=M;t<Nsym-M;t++){let z=0;for(let k=0;k<M;k++)z+=w[k]*samp[t-half+k];const e=lv[idx[t]]-z;for(let k=0;k<M;k++)w[k]+=mu*e*samp[t-half+k];}
+    let sig2=0,err2=0;for(let t=M;t<Nsym-M;t++){let z=0;for(let k=0;k<M;k++)z+=w[k]*samp[t-half+k];let q=lv[0],bd=1e9;for(const L of lv){const dd=Math.abs(z-L);if(dd<bd){bd=dd;q=L;}}sig2+=q*q;err2+=(z-q)**2;}
+    return {snr:10*Math.log10(sig2/Math.max(err2,1e-30)),ph:bp};}
+  const linNo=new Float64Array(N);for(let i=0;i<N;i++)linNo[i]=r[i]/(2*C);
+  const linC=cancel();
+  const rNo=ffeSNR(linNo),rC=ffeSNR(linC);
+  return {lin:linC,idx,lv,sps,ph:rC.ph,tau,beta,cspr,gamma,snrNo:rNo.snr,snrCancel:rC.snr};
+}
+
+/* 2-PD electrical crosstalk */
+function xtalkSim(p){
+  const {xt,K,cmFrac,cmrr,snr,sps,Nsym}=p;
+  const rng=mulberry(55);const N=Nsym*sps;
+  const vb=new Uint8Array(Nsym);for(let i=0;i<Nsym;i++)vb[i]=rng()<0.5?0:1;
+  const vic=new Float64Array(N);for(let i=0;i<Nsym;i++){const v=vb[i]?1:0;for(let k=0;k<sps;k++)vic[i*sps+k]=v;}
+  const _dt=(1000/4)/sps;let vicF=onepole(vic,8,_dt);
+  const a=Math.pow(10,xt/20);const xtot=new Float64Array(N);
+  for(let kk=0;kk<K;kk++){const arng=mulberry(1000+kk*7);const ab=new Uint8Array(Nsym);for(let i=0;i<Nsym;i++)ab[i]=arng()<0.5?0:1;
+    for(let i=0;i<Nsym;i++){const v=(ab[i]?1:0)-0.5;for(let k=0;k<sps;k++)xtot[i*sps+k]+=a*v;}}
+  const cmA=Math.sqrt(cmFrac),dfA=Math.sqrt(1-cmFrac),cmres=Math.pow(10,-cmrr/20);
+  const sd=std(vicF);const npw=sd*sd/Math.pow(10,snr/10);const ns=Math.sqrt(npw);
+  const se=new Float64Array(N),pd=new Float64Array(N);
+  for(let i=0;i<N;i++){const xc=cmA*xtot[i],xd=dfA*xtot[i];const n1=ns*randn(rng),n2=ns*randn(rng);
+    se[i]=vicF[i]+xc+xd+n1;
+    pd[i]=vicF[i]+xd+xc*cmres+(n1-n2)/Math.SQRT2;}
+  const bSE=bestPhaseQ(se,vb,sps,Nsym),bPD=bestPhaseQ(pd,vb,sps,Nsym);
+  return {se,pd,vb,sps,phSE:bSE.ph,phPD:bPD.ph,berSE:berNRZ(bSE.Q),berPD:berNRZ(bPD.Q),Qse:bSE.Q,Qpd:bPD.Q};
+}
+
+
+/* RX sensitivity: BER vs received optical power. Calibrated to eKit slide-3 PIN: 1e-13@-14dBm.
+   Q ~ kQ * P^0.35 (sub-linear: LED signal-dependent noise), calibrated to PTL2025 Fig6. */
+function sensBER(PdBm,ERdB,Rb){
+  const P=Math.pow(10,PdBm/10); // mW (average received optical power)
+  const kQ=18.7,nP=0.31;        // Q~kQ*P^nP: fit to PTL2025 Fig6 waterfall SLOPE (nP=0.31 = signal-dependent LED noise). thermal-limited would be nP=1 (steeper)
+  const Ppow=Math.pow(P,nP);
+  const er=Math.pow(10,(ERdB===undefined?6.5:ERdB)/10);
+  const oma=(er-1)/(er+1);
+  const oma0=(Math.pow(10,6.5/10)-1)/(Math.pow(10,6.5/10)+1);
+  const g=oma/oma0;                              // relative OMA vs calibration ER=6.5dB
+  const Q=kQ*Ppow*g;             // waterfall shape only (nP fit to Fig6). Baud sensitivity applied as a power shift by caller.
+  return {Q,ber:berNRZ(Q)};
+}
+/* TX ABC model (SPIE 2026, NCSU+Avicena). 1/tau_DCL = A + 2*B*N + 3*C*N^2 (differential lifetime).
+   N solved from J via generation=recombination: A*N + B*N^2 + C*N^3 = J/(q*d).
+   Measured coeffs: A=3e8 s^-1, B=4e-11 cm3/s, C=5e-29 cm6/s (A,C ~100x lighting LED -> speed over efficiency).
+   tau_nr (via A + Auger 3CN^2) dominates and drops with J and T -> BW rises. SQW faster than 2QW (unequal well filling). */
+function ledBWfromJ(J,Tc,qw){
+  /* base = Rogers et al. PTL 36,1069 (2024), NCSU deck slide 13 "Bandwidth versus Current and
+     Temperature", 25C trace, read from the plot:
+        J (A/cm2):   10    100   1000   3000   6000   10000
+        E-O 3dB:    0.55  0.70   0.85   1.5    2.6    3.5    GHz
+     These are E-O (optical S21): the same deck's impedance fit gives tau = 534 ps at 104 A/cm2,
+     whose E-O 3dB is 521 MHz and matches the 0.55-0.70 GHz floor; the E-E value (301 MHz) does
+     not. bwOfJ() therefore returns the E-E corner = E-O / sqrt(3), which is what a filter applied
+     to the optical waveform needs.
+     v337/v340 carried a different table (1.7 -> 4.8 GHz) citing the wrong slide; it sat 1.5-2.1x
+     above the deck and rose steadily where the deck is flat then steep. */
+  const base=bwOfJ(J);
+  const qwf=(qw===2?0.55:1.0);
+  const w=Math.max(0,1-(Math.log10(J)-1)/3);
+  const tBoost=1+0.5*w*(Math.max(Tc||25,25)-25)/375;
+  return Math.max(0.15,Math.min(tBoost*qwf*base,6));
+}
+function bwOfJ(J){/* E-E corner = slide-13 E-O / sqrt(3) */const Jt=[10,100,1000,3000,6000,10000],Bt=[0.318,0.404,0.491,0.866,1.501,2.021];J=Math.max(Math.min(J,10000),10);const lj=Math.log10(J);for(let i=0;i<Jt.length-1;i++){if(lj<=Math.log10(Jt[i+1])){const t=(lj-Math.log10(Jt[i]))/(Math.log10(Jt[i+1])-Math.log10(Jt[i]));return Bt[i]+t*(Bt[i+1]-Bt[i]);}}return Bt[5];}
+function jOfBw(bw){const Jt=[100,500,1000,2000,5000,10000],Bt=[1.7,2.2,2.8,3.3,4.2,4.8];bw=Math.max(Math.min(bw,4.8),1.42);for(let i=0;i<Bt.length-1;i++){if(bw<=Bt[i+1]){const t=(bw-Bt[i])/(Bt[i+1]-Bt[i]);return Math.pow(10,Math.log10(Jt[i])+t*(Math.log10(Jt[i+1])-Math.log10(Jt[i])));}}return Jt[5];}
+function _drawModelFlow(c){const g=c.getContext('2d');clear(g,c);
+g.fillStyle='#e6edf3';g.font='bold 13px system-ui';g.fillText('How the four main tabs model the link',12,18);
+const box=(x,y,w,h,col,lines,f)=>{g.strokeStyle=col;g.lineWidth=1.4;g.strokeRect(x,y,w,h);g.fillStyle=col;g.font=(f||'9px')+' system-ui';let yy=y+13;for(const t of lines){g.fillText(t,x+5,yy);yy+=11;}};
+const arr=(x1,y1,x2,y2,col)=>{g.strokeStyle=col;g.lineWidth=1.2;g.beginPath();g.moveTo(x1,y1);g.lineTo(x2,y2);g.stroke();const a=Math.atan2(y2-y1,x2-x1);g.fillStyle=col;g.beginPath();g.moveTo(x2,y2);g.lineTo(x2-6*Math.cos(a-0.4),y2-6*Math.sin(a-0.4));g.lineTo(x2-6*Math.cos(a+0.4),y2-6*Math.sin(a+0.4));g.closePath();g.fill();};
+/* Tab 1 chain row */
+const Y=44,H=46,W=84,G=8;let X=12;const cG='#3fb950';
+g.fillStyle=cG;g.font='bold 10px system-ui';g.fillText('TAB 1 - Link (signal chain, shared P params):',12,Y-6);
+const chain=[["NRZ bits","PRBS"],["TX pre-emph","1-pole boost","cost: ER"],["LED","asym IIR +","slow tail","BW = f(J)"],["CD","gaussian","D L dLam"],["Modal","rect","NA^2 L/2nc"],["RX filter","gaussian","rxBW"],["RX DFE","1-tap, -h1","(slider)"],["sample","SNR / BER"]];
+const xs=[];for(const b of chain){box(X,Y,W,H,cG,b);xs.push(X);X+=W+G;if(xs.length<chain.length)arr(X-G,Y+H/2,X,Y+H/2,cG);}
+/* noise + Q note */
+/* Tab 2 Collection feeds Prx */
+const Y2=Y+H+34;const cB='#58a6ff';
+box(12,Y2,236,58,cB,["TAB 2 - Collection (geometry)","etendue: LED size, pitch, NA, standoff","-> coupling loss + OPTICAL crosstalk","output: Prx into the sigma above"],'10px');
+const ah=(x,y,col)=>{g.fillStyle=col;g.beginPath();g.moveTo(x,y);g.lineTo(x-4,y+7);g.lineTo(x+4,y+7);g.closePath();g.fill();};
+const seg2=(pts,col)=>{g.strokeStyle=col;g.lineWidth=1.2;g.beginPath();g.moveTo(pts[0][0],pts[0][1]);for(let q=1;q<pts.length;q++)g.lineTo(pts[q][0],pts[q][1]);g.stroke();};
+seg2([[130,Y2],[130,Y+H+23],[698,Y+H+23],[698,Y+H+3]],cB);ah(698,Y+H+3,cB);
+g.fillStyle=cB;g.font='9px system-ui';g.fillText('Prx',640,Y+H+20);
+/* Tab 4 DFE detail feeds DFE box */
+const cR='#ef4444';
+box(268,Y2,236,58,cR,["TAB 4 - RX DFE (circuit view)","same chain as Tab 1 + latch, steer pair","fits h1, shows eyes / cursors / freq resp","the DFE box above = this, as one knob"],'10px');
+seg2([[386,Y2],[386,Y+H+11],[606,Y+H+11],[606,Y+H+3]],cR);ah(606,Y+H+3,cR);
+/* Tab 3 independent */
+const cY='#e5c07b';
+box(524,Y2,224,58,cY,["TAB 3 - Electrical xtalk (2-PD)","INDEPENDENT electrical model:","aggressor coupling vs CMRR","does NOT feed Tab 1 (by design)"],'10px');
+g.fillStyle='#8b98ac';g.font='9px system-ui';
+g.fillText('noise (analytic, not in waveform): sigma = IRN sqrt(BW_eff)(1+P0)/(2 R Prx); sigma_ISI = kISI(std_hi+std_lo); SNR = 20log10(eye/2sigma) -> BER',12,Y2+58+16);g.fillText('All tabs read the same global parameter set P - changing Reach or Baud in one tab changes it everywhere. Presets reset the whole set.',12,Y2+58+30);}
+
+
+
 function _modalDensity(NA,alpha,fill,reachM,NB){
   NB=NB||90;
   if(!(NA>0)||!(reachM>0))return null;
@@ -79,10 +300,8 @@ function _modalDensity(NA,alpha,fill,reachM,NB){
       if(num<=0)continue;const sr=Math.sqrt(num);
       Lz+=beta/sr*dr;Tt+=n*n/(C0*sr)*dr;}
     return Lz>0?Tt/Lz:nco/C0;};
-  /* 600 rays over 90 bins leaves about one ray per bin in the tail, which makes the
-     last bin jump around by 10%. 2400 brings it to ~4 per bin and the tail reads clean.
-     spread, rms and |H| are unchanged to four digits - only the drawn shape improves. */
-  const thMax=Math.asin(Math.min(NA/nco,0.999)),NR=2400,rays=[];  for(let i=0;i<NR;i++){const th=(i+0.5)/NR*thMax,t=delayOf(th);
+  const thMax=Math.asin(Math.min(NA/nco,0.999)),NR=600,rays=[];
+  for(let i=0;i<NR;i++){const th=(i+0.5)/NR*thMax,t=delayOf(th);
     if(t===null)continue;
     const _sg=(fill*Math.PI/180)/1.17741;const w=Math.sin(th)*Math.cos(th)*((fill>=90)?1:Math.exp(-(th*th)/(2*_sg*_sg)));
     rays.push({t,w});}
@@ -107,37 +326,137 @@ function _modalH(dens,fGHz){
     const ph=-2*Math.PI*fGHz*1e9*t;re+=dens.bins[i]*Math.cos(ph);im+=dens.bins[i]*Math.sin(ph);}
   return Math.hypot(re,im);
 }
-function _modalSpreadPs(NA,alpha,reachM){
-  if(!(NA>0)||!(reachM>0))return 0;
-  const NCL=1.457,C0=299792458;
-  const nco=Math.sqrt(NCL*NCL+NA*NA),DEL=(nco*nco-NCL*NCL)/(2*nco*nco);
-  const nOf=u=>nco*Math.sqrt(Math.max(1-2*DEL*Math.pow(Math.min(u,1),alpha),1e-9));
-  const delayOf=th=>{const beta=nco*Math.cos(th);
-    const sq=(1-Math.pow(beta/nco,2))/(2*DEL);
-    if(sq<=0)return nco/C0;
-    const rt=Math.pow(sq,1/alpha); if(rt>1)return null;
-    let Lz=0,Tt=0;const N=260,dr=rt/N;
-    for(let i=0;i<N;i++){const r=(i+0.5)/N*rt,n=nOf(r),num=n*n-beta*beta;
-      if(num<=0)continue;const sr=Math.sqrt(num);
-      Lz+=beta/sr*dr;Tt+=n*n/(C0*sr)*dr;}
-    return Lz>0?Tt/Lz:nco/C0;};
-  const thMax=Math.asin(Math.min(NA/nco,0.999));let t0=1e9,t1=-1e9;
-  for(let i=0;i<140;i++){const t=delayOf((i+0.5)/140*thMax);if(t===null)continue;
-    t0=Math.min(t0,t);t1=Math.max(t1,t);}
-  return (t1-t0)*reachM*1e12;
+
+
+/* End-to-end optical budget: LED power -> launch -> fibre -> collection -> Prx.
+   Reuses the same geometry the Collection tab draws, so the two agree by construction. */
+function _optBudget(){
+  const em=P.emD, NA=P.fiberNA, core=_coreD();
+  const omaUW=Math.max(P.pLed,1e-3);
+  /* TX: emitter through the TIR lens into the core (same model as the Collection tab, TX side) */
+  const thTX=12*Math.PI/180, lensTX=em/Math.sin(thTX), zTX=30, capture=0.85;
+  const beamF=lensTX+2*zTX*Math.tan(thTX);
+  const spatial=Math.min(1,diskOverlap(core/2,beamF/2,Math.abs(P.txOff||0))/(Math.PI*(beamF/2)*(beamF/2)));
+  const angular=Math.min(1,(NA/Math.sin(thTX))*(NA/Math.sin(thTX)));
+  const launch=Math.max(1e-4,Math.min(1,spatial*capture*angular));
+  const launchdB=-10*Math.log10(launch);
+  /* fibre attenuation over the reach */
+  const fibdB=Math.max(0,P.fibAtt)*Math.max(0,P.reach);
+  /* RX: lens capture x core-to-lens cover x PD fill (same terms as the Collection tab, RX side) */
+  const Del=Math.max(P.lensD,P.pdD), z=P.zStand, refl=P.dtiRefl/100;
+  const s12=Math.sin(12*Math.PI/180);
+  const th=Math.asin(Math.min(0.99,Math.min(1,50/Del)*s12));
+  const Dbeam=Del+2*z*Math.tan(th), bA=Math.PI*(Dbeam/2)*(Dbeam/2);
+  const ov=(R,r)=>{const d=0;if(r>=R)return Math.PI*R*R;return Math.PI*r*r;};
+  /* 2-PD dual-collect: two detectors side by side inside one lens pitch, so each one is
+     capped at half the pitch minus the gap. Areas add; the smaller discs cost some fill. */
+  const dEff=_rxIsDual()?Math.min(P.pdD,Math.max((P.lensD-P.pdGap2)/2,2)):P.pdD;
+  const nPD=_rxIsDual()?2:1;
+  const f0=Math.min(1,nPD*ov(Dbeam/2,dEff/2)/bA);
+  const fw=Math.min(1,ov(Dbeam/2,Math.min(Del,Dbeam)/2)/bA);
+  const pdOut={dEff,nPD};
+  const fill=Math.min(1,0.90*Math.min(1,(Del/core)*(Del/core))
+                       *(f0+Math.max(0,fw-f0)*refl*Math.min(1,P.dtiH/Math.max(z,1))));
+  const collDB=-10*Math.log10(Math.max(fill,1e-4));
+  const pLedDBm=10*Math.log10(omaUW/1000);
+  return {pLedDBm, omaUW, launchdB, fibdB, collDB, dEff:pdOut.dEff, nPD:pdOut.nPD,
+          spatialdB:-10*Math.log10(spatial), angulardB:-10*Math.log10(angular), capdB:-10*Math.log10(capture),
+          prx: pLedDBm-launchdB-fibdB-collDB,
+          launchPct:100*launch, fillPct:100*fill};
 }
-function axes(ctx,c,pad,xlab,ylab,title){ctx.strokeStyle='#25324e';ctx.lineWidth=1;ctx.strokeRect(pad.l,pad.t,c._w-pad.l-pad.r,c._h-pad.t-pad.b);if(title){ctx.fillStyle='#cbd5e1';ctx.font='12px system-ui';ctx.fillText(title,pad.l,pad.t-6);}ctx.fillStyle='#8b98ac';ctx.font='11px system-ui';if(xlab)ctx.fillText(xlab,(c._w)/2-30,c._h-6);if(ylab){ctx.save();ctx.translate(11,(c._h)/2+20);ctx.rotate(-Math.PI/2);ctx.fillText(ylab,0,0);ctx.restore();}}
-function linePlot(ctx,c,series,xr,yr,pad,ylog){
-  const X=v=>pad.l+(v-xr[0])/(xr[1]-xr[0])*(c._w-pad.l-pad.r);
-  const tY=ylog?(v=>Math.log10(Math.max(v,1e-20))):(v=>v);const y0=tY(yr[0]),y1=tY(yr[1]);
-  const Y=v=>pad.t+(1-(tY(v)-y0)/(y1-y0))*(c._h-pad.t-pad.b);
-  ctx.strokeStyle='#16223c';ctx.lineWidth=1;ctx.fillStyle='#66748e';ctx.font='10px system-ui';
-  const nx=5;for(let i=0;i<=nx;i++){const xv=xr[0]+(xr[1]-xr[0])*i/nx,px=X(xv);ctx.beginPath();ctx.moveTo(px,pad.t);ctx.lineTo(px,c._h-pad.b);ctx.stroke();ctx.fillText(xv.toFixed(Math.abs(xv)<10?1:0),px-8,c._h-pad.b+12);}
-  ctx.textAlign='right';if(ylog){for(let e=Math.ceil(y0);e<=Math.floor(y1);e++){const py=Y(Math.pow(10,e));ctx.beginPath();ctx.moveTo(pad.l,py);ctx.lineTo(c._w-pad.r,py);ctx.stroke();ctx.fillText('1e'+e,pad.l-5,py+3);}}
-  else{const ny=4;for(let i=0;i<=ny;i++){const yv=yr[0]+(yr[1]-yr[0])*i/ny,py=Y(yv);ctx.beginPath();ctx.moveTo(pad.l,py);ctx.lineTo(c._w-pad.r,py);ctx.stroke();ctx.fillText(yv.toFixed(1),pad.l-5,py+3);}}ctx.textAlign='left';
-  for(const s of series){ctx.strokeStyle=s.c;ctx.lineWidth=s.w||2;ctx.beginPath();let started=false;for(const pt of s.d){const yv=pt[1];if(yv==null||!isFinite(tY(yv))){started=false;continue;}const px=X(pt[0]),py=Y(yv);if(!started){ctx.moveTo(px,py);started=true;}else ctx.lineTo(px,py);}ctx.stroke();}
-  const _lg=series.filter(s=>s.name);if(_lg.length){ctx.font='10px system-ui';ctx.textAlign='left';let _mw=0;for(const s of _lg)_mw=Math.max(_mw,ctx.measureText(s.name).width);const _bw=_mw+20,_bx=c._w-pad.r-_bw-2,_by=pad.t+2;ctx.fillStyle='rgba(13,17,23,0.62)';ctx.fillRect(_bx,_by,_bw,_lg.length*14+4);let ly=_by+12;for(const s of _lg){ctx.fillStyle=s.c;ctx.fillRect(_bx+4,ly-7,9,3);ctx.fillStyle='#cbd5e1';ctx.fillText(s.name,_bx+17,ly-2);ly+=14;}}
+/* Two independent crosstalk mechanisms, each from its own physics.
+   OPTICAL: light from a neighbour lens spilling onto this PD - pure geometry, same
+            model the Collection tab draws (beam overlap, DTI shielding, n neighbours).
+   ELECTRICAL: coupling between adjacent RX input nodes - scales with node pitch and baud.
+   The input-node pitch is the PD pitch, so it is not a free parameter here.
+   Single-ended PD, so the receiver takes both in full. */
+function _xtResidual(){
+  const baud=Math.max(P.Rb,0.1);
+  const Del=Math.max(P.lensD,P.pdD), z=Math.max(P.zStand,1), refl=P.dtiRefl/100;
+  const s12=Math.sin(12*Math.PI/180);
+  const th=Math.asin(Math.min(0.99,Math.min(1,50/Del)*s12));
+  const Dbeam=Del+2*z*Math.tan(th), Rb_=Dbeam/2, bA=Math.PI*Rb_*Rb_;
+  const gbase=diskOverlap(Rb_,P.pdD/2,Math.abs(Del))/bA;
+  const xtO=Math.min(1,gbase*(1-refl*Math.min(1,P.dtiH/z))*Math.max(P.nbr,1));
+  const xtOdB=10*Math.log10(Math.max(xtO,1e-9));
+  /* electrical crosstalk couples between adjacent PD -> TIA input nodes,
+     so the PD size/pitch sets it - the lens plays no part here. */
+  /* the input-node pitch is set by whichever is larger - a PD cannot sit closer to its
+     neighbour than the lens pitch allows, and a PD wider than the lens sets its own pitch */
+  const pitch=Math.max(P.pdD,P.lensD,4), nAgg=Math.max(P.nbr,1);
+  const xtEraw=-22+20*Math.log10(20/pitch)+20*Math.log10(baud/4)+10*Math.log10(nAgg);
+  /* a differential front end sees the part that couples into BOTH nodes as common mode
+     and rejects it to the CMRR limit; the rest survives */
+  const cm=_rxIsDual()?Math.max(0,Math.min(1,P.cmFrac)):0, rej=Math.pow(10,-P.cmrr/10);
+  const xtEdB=xtEraw+10*Math.log10((1-cm)+cm*rej);
+  const eff=Math.pow(10,xtOdB/10)+Math.pow(10,xtEdB/10);
+  return {xtOdB, xtEdB, xtEraw, effDB:10*Math.log10(Math.max(eff,1e-12)), amp:Math.sqrt(eff)};
 }
+
+/* Slide 16 shows the LED S21 -3 dB point moving with current density: about 1.7 GHz at
+   100 A/cm2 rising to 4.8 GHz at 10 kA/cm2, so the link tabs never treat LED bandwidth as a
+   free number: it is always read off that curve, using the drive current implied by the
+   optical power (PTL Fig 4: about 53 uW per mA) and the emitter area. */
+function _ledJ(){
+  const mA=Math.max(P.pLed,1)/53;                    /* PTL Fig 4: about 53 uW per mA */
+  return Math.max(10,Math.min(1e4,mA*1e-3/(Math.max(P.ledArea,1)*1e-8)));
+}
+function _ledBWeff(){ return bwOfJ(_ledJ()); }
+
+/* One detector choice drives everything downstream. The APD constants are the calibrated
+   eKit values and deliberately not sliders: M = 2.5 with excess noise F = M^0.3, which is a
+   silicon avalanche at 430 nm where absorption is shallow and the multiplication is electron
+   initiated, so k and therefore x are low. Responsivity stays the PIN value and the gain is
+   applied on top of it, so R_eff = R x M. */
+var APD_M=2.5, APD_X=0.3;
+
+/* Lens and fibre core are built as a pair, so the model keeps them equal. Letting them drift apart
+   costs (lens/core)^2 in collection - a 25 um lens facing a 50 um core throws away about 6 dB before
+   anything else happens - and nobody would build that. The lens slider is the control; the core
+   follows it, which is why there is no separate core slider on the link tabs. */
+function _coreD(){ return Math.max(1,P.lensD||50); }
+function _rxIsDual(){ return (P.rxDet|0)===1; }
+function _rxGain(){ return ((P.rxDet|0)===2)?APD_M:1; }
+function _isiBudget(){
+  const Rb=Math.max(P.Rb||4,0.1), UI=1000/Rb;
+  /* LED, main path (ledResp): rise essentially instantaneous; fall = (1-tf) instantaneous plus a
+     fraction tf decaying with fixed time constant ledTailPs. rms of (1-tf)*delta + tf*exp(-t/tau)/tau
+     is tau*sqrt(tf*(2-tf)); half of NRZ transitions are falls -> multiply by sqrt(1/2).
+     Through v340 this row was computed from a single pole (then a two-pole blend) at ledBW, which is
+     NOT what the chain applies; it under-reported the LED term by 4-10x. */
+  const tf=Math.max(0,Math.min(0.9,P.ledTail||0)), tauT=Math.max(5,P.ledTailPs||250);
+  const sLED=tauT*Math.sqrt(tf*(2-tf))*Math.SQRT1_2;
+  const sCD=(P.Dcd*(Math.max(P.reach,0)/1000)*P.dlam)/2.355;
+  const dn=_modalDensity(P.linkNA,(P.fbAlpha===undefined?99:P.fbAlpha),
+                         (P.th50===undefined?5.5:P.th50),Math.max(P.reach,0),90);
+  const sMOD=dn?dn.rmsPs:0;
+  const sRX=(P.rxBW>0)?0.18*(Rb/P.rxBW)*UI:0;
+  const vL=sLED*sLED, vC=sCD*sCD, vM=sMOD*sMOD, vR=sRX*sRX, vT=vL+vC+vM+vR;
+  const pct=v=>vT>0?(100*v/vT):0;
+  return {UI:UI,
+    led:{rms:sLED,ui:sLED/UI,pct:pct(vL)},
+    cd:{rms:sCD,ui:sCD/UI,pct:pct(vC)},
+    mod:{rms:sMOD,ui:sMOD/UI,pct:pct(vM)},
+    rx:{rms:sRX,ui:sRX/UI,pct:pct(vR)},
+    tot:{rms:Math.sqrt(vT),ui:Math.sqrt(vT)/UI}};
+}
+function _fmtSNR(db){return (db>0.5)?(db.toFixed(1)+' dB'):'n/a (eye closed)';}
+function _isiTableHTML(extra){
+  const b=_isiBudget();
+  const row=(n,d,note)=>'<tr><td>'+n+'</td><td>'+d.rms.toFixed(1)+'</td><td>'+d.ui.toFixed(3)
+    +'</td><td>'+d.pct.toFixed(0)+'%</td><td class="dim">'+note+'</td></tr>';
+  return '<table class="isit"><tr><th>ISI source</th><th>rms (ps)</th><th>UI</th>'
+    +'<th>share of variance</th><th>which side of the cursor</th></tr>'
+    +row('LED fall tail',b.led,'causal, falling edge only; fixed time constant ledTailPs')
+    +row('Modal (ray-traced)',b.mod,'causal - one-sided; it looks two-sided only because the kernel is centred on its centroid rather than its peak, which is a coordinate choice, not physics')
+    +row('Chromatic (CD)',b.cd,'symmetric - pre AND post')
+    +row('RX bandwidth',b.rx,'symmetric - pre AND post; sigma = 0.18*(Rb/rxBW) UI')
+    +'<tr class="tot"><td>total</td><td>'+b.tot.rms.toFixed(1)+'</td><td>'+b.tot.ui.toFixed(3)
+    +'</td><td>100%</td><td class="dim">rms adds in quadrature, so the share column is '
+    +'sigma squared - it reads as "how much would vanish if this source went away"</td></tr>'
+    +(extra||'')+'</table>';
+}
+var _mkCache={};
 function _modalKernel(NA,alpha,fill,reachM,Rb,sps){
   if(!(NA>0)||!(reachM>0))return null;
   const key=NA.toFixed(3)+'|'+alpha.toFixed(2)+'|'+fill.toFixed(2)+'|'+reachM.toFixed(2)+'|'+Rb.toFixed(2)+'|'+sps;
@@ -175,550 +494,248 @@ function _modalKernel(NA,alpha,fill,reachM,Rb,sps){
   for(let i=0;i<Nw;i++){const j=i-shift+K;if(j>=0&&j<k.length)k[j]+=tmp[i]/sum;}
   _mkCache[key]=k;return k;
 }
-const TABS={cdlp:{ctrls:()=>'<div class="subtabs">'+'<button class="sub'+(P.dispSub===1?' on':'')+'" onclick="P.dispSub=1;build()">Modal</button>'+'<button class="sub'+(P.dispSub===2?' on':'')+'" onclick="P.dispSub=2;build()">Fiber modes</button>'+'</div>'+(P.dispSub===0? slider('reach','Reach (m)',0,100,2)+slider('dlam','µLED Δλ FWHM (nm)',4,20,1)+slider('Dcd','CD @430nm (ps/nm·km)',300,600,10)+slider('cdRb','Modulation baud (Gbaud)',1,12,0.5): P.dispSub===1? slider('reach','Reach (m)',0,100,2)+slider('cdRb','Modulation baud (Gbaud)',1,12,0.5)+slider('fibNA','Bundle NA',0.05,0.5,0.01)+slider('fbAlpha','Index profile alpha (2 = graded/parabolic, 99 = step)',1.5,99,0.05)+slider('th50','Launch far-field half-angle at 50% (deg; 90 = overfilled)',2,90,0.5): slider('reach','Reach (m)',0,100,2)+slider('Rb','Modulation baud (Gbaud)',1,12,0.5)+slider('fibNA','Fiber NA',0.05,0.5,0.01)+slider('fbAlpha','Profile alpha (2 = parabolic, 99 = step)',1.5,99,0.05)+slider('fbCoreR','Core radius (um)',5,40,1)+slider('fbClad','Cladding thickness (um)',1,40,1)+slider('fbLam','Wavelength (nm)',400,1600,10)+slider('th50','Launch half-angle at 50% (deg; 90 = overfilled)',2,90,0.5)),render(){
-const el=view();
-if(P.dispSub===2){if(el._lay!=='fib'){el.innerHTML='';el._init=0;el._lay='fib';}TABS.fiber.render();return;}
-if(el._lay!=='disp'){el.innerHTML='';el._init=0;el._lay='disp';}
-if(!el._init){el.innerHTML='';el._p=mkCanvas('cdp',104);el._m=mkCanvas('cdm',232);el._dv=mkCanvas('cddv',236);el._fp=mkCanvas('cdfp',240);el._ct=mkCanvas('cdct',232);el._wy=mkCanvas('cdwy',174);el._md=mkCanvas('cdmd',252);el.append(el._m,el._fp,el._ct,el._md,el._p,el._dv,el._wy);el.insertAdjacentHTML('beforeend','<p class="note" id="mdnote"></p>');el._init=1;}
-    {const _nt=document.getElementById('mdnote');
-     if(_nt){
-      if(P.dispSub!==1){_nt.style.display='none';}
-      else{_nt.style.display='';
-       const _k=_modalKernel(P.fibNA,(P.fbAlpha===undefined?99:P.fbAlpha),(P.th50===undefined?5.5:P.th50),Math.max(P.reach,0),Math.max(P.cdRb,0.1),12);
-       let _nz=0,_pk=0;if(_k){for(let q=0;q<_k.length;q++){if(_k[q]>1e-9)_nz++;_pk=Math.max(_pk,_k[q]);}}
-       const _sp=_k?(_nz/12).toFixed(2):'0';
-       _nt.innerHTML='<b>How this is computed.</b> There is no closed-form dispersion number anywhere in this model - modal dispersion is represented as an <b>FIR filter</b> (the tap array below), and these panels draw that filter directly. Six steps: '
-        +'(1) <b>ray trace</b> - fire a few hundred rays at angles 0 to asin(NA) and integrate the optical path through n(r) = nco*sqrt(1-2*Delta*(r/a)^alpha) to get each ray\'s delay per metre; this is where the profile alpha enters, since in a graded core the steeper rays travel faster near the edge and claw the delay back. '
-        +'(2) <b>weight each ray</b> by sin(theta)*cos(theta) for the solid-angle share, times exp(-theta^2/2*sigma^2) for the launch, with sigma set by the 50% half-angle slider - this is where the launch condition enters. '
-        +'(3) multiply delay per metre by the <b>reach</b>. '
-        +'(4) <b>bin</b> the weighted delays onto the simulator time grid (12 samples per UI). '
-        +'(5) <b>normalise</b> the taps to sum to 1 (modal spreads energy in time, it does not remove any) and align the centroid so changing the shape cannot accidentally shift the sampling phase. '
-        +'(6) in a full link study, the transmitted waveform is <b>convolved</b> with these taps before the receiver - here the panels show the filter itself, which is the honest object: everything a receiver experiences is already in it. '
-        +'<br><br><b>Right now that filter is '+(_k?(_nz+' non-zero taps spanning '+_sp+' UI'):'shorter than one sample of the time grid, so the chain skips the convolution altogether - modal dispersion is negligible at this setting')+'</b> at '+P.cdRb+' Gbaud. The whole tap array is the channel - <b>the spread and rms printed above are descriptions of it, not inputs to it</b>. Two launches with almost the same rms can give very different eyes because the receiver sees the shape, not the statistic. '
-        +'Reading the taps tells you the rest: equal taps mean an overfilled launch (a rectangle, the worst case); taps falling from left to right mean a centre-weighted launch; and pushing alpha toward 2 collapses the whole array to one or two taps, which is modal dispersion disappearing.';
-      }}}
-    {const cdOn=(P.dispSub===0);[el._m,el._fp,el._ct,el._p,el._dv,el._wy].forEach(c=>c.style.display=cdOn?'':'none');el._md.style.display=cdOn?'none':'';}
-const D=P.Dcd,L=P.reach/1000,dl=P.dlam,dtFW=D*L*dl,sigT=Math.max(dtFW/2.355,0.2),f3=Math.min(132.5/sigT,60);
-const cc=299792458,lam=430e-9,Dsi=D*1e-6,fnull=Math.sqrt(cc/(2*Dsi*Math.max(L*1000,0.01)*lam*lam))/1e9;
-const p=el._p.getContext('2d');clear(p,el._p);
-p.fillStyle='#e6edf3';p.font='bold 13px system-ui';p.fillText('4 ·  The fiber CD transfer function is ALL-PASS and the SAME for every source',12,22);
-p.font='12px ui-monospace,monospace';p.fillStyle='#86b7f0';p.fillText('optical field:  H_field(ω) = exp( j·½β₂Lω² )     |H_field| = 1   (phase only, NO null)',18,46);
-p.font='11px system-ui';p.fillStyle='#8b98ac';p.fillText('What differs is the RECEIVED PHOTOCURRENT after square-law detection — that is what we plot.',18,68);
-p.fillStyle='#66748e';p.fillText('Panels 2-3 plot received photocurrent i(f) = m(f)·H_e(f);  H_e = FT of h = channel transfer fn.',18,86);
-const c=el._m.getContext('2d');clear(c,el._m);const W=el._m._w;
-c.fillStyle='#e6edf3';c.font='bold 13px system-ui';c.fillText('1 ·  Broad (incoherent) source: each λ → own delay → h(t) = spectrum in time',12,20);
-const by=158,sx=30,sw=126;
-c.strokeStyle='#25324e';c.lineWidth=1;c.beginPath();c.moveTo(sx,by);c.lineTo(sx+sw,by);c.stroke();
-c.strokeStyle='#58a6ff';c.lineWidth=2;c.beginPath();for(let k=0;k<=60;k++){const u=(k/60-0.5)*5,x=sx+k/60*sw,y=by-56*Math.exp(-u*u/2);k===0?c.moveTo(x,y):c.lineTo(x,y);}c.stroke();
-c.fillStyle='#8b98ac';c.font='10px system-ui';c.fillText('source spectrum S(λ)',sx,by+16);c.fillText('broad Δλ ~ 20 nm',sx,by+28);c.fillText('λ',sx+sw+4,by-2);
-const fx=sx+sw+40,fw=150,fy=by-32;
-c.fillStyle='rgba(139,152,172,0.10)';c.fillRect(fx,fy,fw,22);c.strokeStyle='#8b98ac';c.strokeRect(fx,fy,fw,22);c.fillStyle='#8b98ac';c.fillText('fiber CD',fx,fy-6);
-const cols=['#3b82f6','#22c55e','#ef4444'],dld=[0,0.5,1];
-for(let k=0;k<3;k++){c.strokeStyle=cols[k];c.lineWidth=2;c.beginPath();c.moveTo(fx-4,fy+11);c.lineTo(fx+fw+dld[k]*30,fy+11);c.stroke();c.fillStyle=cols[k];c.beginPath();c.arc(fx+fw+dld[k]*30,fy+11,3,0,7);c.fill();}
-c.fillStyle='#8b98ac';c.font='9px system-ui';c.fillText('τ(λ) = D·L·(λ−λ₀)',fx,fy+40);
-c.strokeStyle='#66748e';c.lineWidth=1;c.beginPath();c.moveTo(fx+fw+46,by-11);c.lineTo(fx+fw+64,by-11);c.stroke();
-const hx=fx+fw+74,hw=W-hx-18;
-c.strokeStyle='#25324e';c.beginPath();c.moveTo(hx,by);c.lineTo(hx+hw,by);c.stroke();
-const spr=Math.max(0.35,Math.min(1,0.35+dtFW/260));
-c.strokeStyle='#3fb950';c.lineWidth=2;c.beginPath();for(let k=0;k<=60;k++){const u=(k/60-0.5)*5/spr,x=hx+k/60*hw,y=by-56*Math.exp(-u*u/2);k===0?c.moveTo(x,y):c.lineTo(x,y);}c.stroke();
-c.fillStyle='#8b98ac';c.font='10px system-ui';c.fillText('h(t)  (intensity)',hx,by+16);c.fillText('width = D·L·Δλ',hx,by+28);c.fillText('t',hx+hw+3,by-2);
-c.fillStyle='#cdd6e4';c.font='12px ui-monospace,monospace';c.fillText('channel transfer function  H_e = FT{S(λ)·τ(λ)}  →  low-pass, NO null (derived in panel 5)',12,by+56);
-const dv=el._dv.getContext('2d');clear(dv,el._dv);
-dv.fillStyle='#e6edf3';dv.font='bold 13px system-ui';dv.fillText('5 ·  Received-photocurrent derivation — same CD, it splits at the source coherence',12,20);
-dv.font='12px ui-monospace,monospace';dv.fillStyle='#86b7f0';dv.fillText('common:  i(t) = |E(t)|² at PD.   CD phase  φ(ω) = β₁(ω−ω_c) + ½β₂(ω−ω_c)²',16,44);
-dv.font='11px system-ui';dv.fillStyle='#8b98ac';dv.fillText('β₁ = group delay , β₂ = GVD .   i(f) = m·H_e = received photocurrent ; H_e = channel transfer fn.',16,60);
-dv.fillStyle='#ef4444';dv.font='11px system-ui';dv.fillText('Coherent (narrow): carrier + two phase-locked sidebands ω_c±ω_m beat at PD →',16,84);
-dv.font='12px ui-monospace,monospace';dv.fillStyle='#f0a3a3';dv.fillText('|H_e(f)| = |cos(½β₂Lω_m²)| = |cos(π·D·L·λ²·f²/c)|   →  NULLS   (β₂)',28,103);
-dv.fillStyle='#3fb950';dv.font='11px system-ui';dv.fillText('Incoherent (broad): many incoherent lines S(λ), no cross-beat → powers ADD →',16,129);
-dv.font='12px ui-monospace,monospace';dv.fillStyle='#86e29a';dv.fillText('h(t) = Σ S(λ)·δ(t−τ(λ))   →   |H_e(f)| = |FT{S(λ)·τ(λ)}|   →  LOW-PASS  (β₁)',28,148);
-dv.fillStyle='#cdd6e4';dv.font='11px system-ui';dv.fillText('Split:  fields BEAT (cos → hits 0 = null)   vs   powers ADD (Σ>0 → never 0 = low-pass).',16,174);
-dv.fillStyle='#8b98ac';dv.fillText('Crossover = linewidth vs modulation BW.   µLED: Δλ≈20nm ≫ GHz → low-pass regime.',16,192);
-dv.fillStyle='#66748e';dv.font='10px system-ui';dv.fillText('Same φ(ω): β₁ (delay spread) wins for a broad source; β₂ (sideband fading) for narrow.',16,214);
-const c2=el._fp.getContext('2d');clear(c2,el._fp);const W2=el._fp._w,H2=el._fp._h;
-c2.fillStyle='#e6edf3';c2.font='bold 13px system-ui';c2.fillText('2 ·  Received photocurrent  i(f) = m(f)·H_e(f)   (m = NRZ, incoherent µLED)',12,18);
-const Lr1=0.004,Lr2=0.040,sR1=Math.max(D*Lr1*dl/2.355,0.2),f3R1=Math.min(132.5/sR1,60),sR2=Math.max(D*Lr2*dl/2.355,0.2);
-const Ffix=Math.min(Math.max(1.7*f3R1,8),60),Tfix=Math.max(3.0*sR2,50);
-const Rb=P.cdRb,Faxis=1.5*Rb,sinc=u=>{u=Math.abs(u);return u<1e-6?1:Math.abs(Math.sin(Math.PI*u)/(Math.PI*u));};
-const padL={l:46,r:W2/2+26,t:44,b:38};
-axes(c2,el._fp,padL,'','','h(t): impulse response   Δt = '+dtFW.toFixed(0)+' ps   (fixed axis)');
-const hd=[];for(let k=0;k<=240;k++){const t=(k/240-0.5)*2*Tfix;hd.push([t,Math.exp(-t*t/(2*sigT*sigT))]);}
-linePlot(c2,el._fp,[{d:hd,c:'#3fb950'}],[-Tfix,Tfix],[0,1.15],padL,false);
-const pwL=el._fp._w-padL.l-padL.r,phL=H2-padL.t-padL.b,t0x=padL.l+0.5*pwL,yb=padL.t+phL,yt=padL.t+(1-1/1.15)*phL;
-if(dtFW<Tfix/12){c2.strokeStyle='#3fb950';c2.lineWidth=2.5;c2.beginPath();c2.moveTo(t0x,yb);c2.lineTo(t0x,yt);c2.stroke();c2.fillStyle='#3fb950';c2.beginPath();c2.moveTo(t0x,yt-1);c2.lineTo(t0x-4,yt+7);c2.lineTo(t0x+4,yt+7);c2.closePath();c2.fill();c2.font='11px system-ui';c2.fillText('δ(t)',t0x+7,yt+9);c2.fillStyle='#8b98ac';c2.font='9px system-ui';c2.fillText('no dispersion: all λ arrive together',t0x+7,yt+22);}
-c2.fillStyle='#8b98ac';c2.font='10px system-ui';c2.fillText('time (ps)',(46+W2/2-26)/2-16,H2-10);
-const padR={l:W2/2+54,t:44,b:38,r:16};
-axes(c2,el._fp,padR,'','','i(f) = m·H_e    (H_e -3dB @ '+f3.toFixed(1)+' GHz)');
-const ifd=[];for(let k=0;k<=200;k++){const ff=k/200*Faxis,mm=sinc(ff/Rb),He=Math.exp(-Math.pow(2*Math.PI*ff*sigT*1e-3,2)/2);ifd.push([ff,mm*He]);}
-linePlot(c2,el._fp,[{d:ifd,c:'#58a6ff'}],[0,Faxis],[0,1.15],padR,false);
-c2.fillStyle='#8b98ac';c2.fillText('freq (GHz)',(W2/2+54+W2-16)/2-18,H2-10);
-const pw=W2-padR.l-padR.r,ph=H2-padR.t-padR.b;
-const nx=padR.l+(Rb/Faxis)*pw;c2.strokeStyle='#66748e';c2.setLineDash([2,2]);c2.beginPath();c2.moveTo(nx,padR.t);c2.lineTo(nx,padR.t+ph);c2.stroke();c2.setLineDash([]);c2.fillStyle='#66748e';c2.font='9px system-ui';c2.fillText('Rb (sinc null)',nx-8,padR.t+ph+11);
-if(f3<Faxis){const fxx=padR.l+(f3/Faxis)*pw;c2.strokeStyle='#e5c07b';c2.setLineDash([3,3]);c2.beginPath();c2.moveTo(fxx,padR.t);c2.lineTo(fxx,padR.t+ph);c2.stroke();c2.setLineDash([]);c2.fillStyle='#e5c07b';c2.font='9px system-ui';c2.fillText('H_e -3dB',fxx+2,padR.t+11);}
-const c3=el._ct.getContext('2d');clear(c3,el._ct);const W3=el._ct._w,H3=el._ct._h;
-c3.fillStyle='#e6edf3';c3.font='bold 13px system-ui';c3.fillText('3 ·  Received i(f) = m·H_e (LED vs laser)   +   laser channel null comb',12,18);
-const pA={l:46,r:W3/2+26,t:44,b:38};
-axes(c3,el._ct,pA,'','','received i(f):  LED vs laser');
-const iLED=[],iLAS=[];for(let k=0;k<=200;k++){const ff=k/200*Faxis,mm=sinc(ff/Rb);iLED.push([ff,mm*Math.exp(-Math.pow(2*Math.PI*ff*sigT*1e-3,2)/2)]);iLAS.push([ff,mm*((isFinite(fnull)&&fnull>0)?Math.abs(Math.cos(Math.PI/2*Math.pow(ff/fnull,2))):1)]);}
-linePlot(c3,el._ct,[{d:iLAS,c:'#ef4444',name:'laser'},{d:iLED,c:'#3fb950',name:'LED'}],[0,Faxis],[0,1.15],pA,false);
-
-const _drp=(isFinite(fnull)&&fnull>0)?-20*Math.log10(Math.max(Math.abs(Math.cos(Math.PI/2*Math.pow(Rb/fnull,2))),1e-6)):0;const _vrd=(_drp<0.5)?'flat by physics':(_drp<3?'droop at band edge':'null in band: FFE useless');c3.fillStyle='#f0a3a3';c3.font='9px system-ui';c3.fillText('f_null '+(fnull>=1000?(fnull/1000).toFixed(1)+' THz':fnull.toFixed(0)+' GHz')+' ('+(fnull/Rb).toFixed(1)+'x band), droop '+_drp.toFixed(2)+' dB - '+_vrd,pA.l,H3-2);
-const pB={l:W3/2+54,t:44,b:38,r:16},pwB=W3-(W3/2+54)-16,phB=H3-44-38;
-axes(c3,el._ct,pB,'','','laser |H_e| on log f: nulls SLIDE with reach');
-const xOf=fg=>pB.l+((Math.log10(Math.max(fg,1))-0)/4)*pwB;
-c3.fillStyle='rgba(88,166,255,0.14)';c3.fillRect(pB.l,pB.t,Math.max(xOf(Rb)-pB.l,2),phB);
-if(isFinite(fnull)&&fnull>0){c3.strokeStyle='#ef4444';c3.lineWidth=1.4;c3.beginPath();let started=false;
-for(let k=0;k<=460;k++){const fg=Math.pow(10,k/460*4);if(fg>2.2*fnull)break;
- const H=Math.abs(Math.cos(Math.PI/2*Math.pow(fg/fnull,2)));const X=xOf(fg),Y=pB.t+phB-H*(phB-6);
- if(!started){c3.moveTo(X,Y);started=true;}else c3.lineTo(X,Y);}c3.stroke();
-const xe=xOf(2.2*fnull);if(xe<pB.l+pwB){c3.fillStyle='rgba(239,68,68,0.15)';c3.fillRect(xe,pB.t,pB.l+pwB-xe,phB);c3.fillStyle='#ef4444';c3.font='9px system-ui';c3.fillText('dense comb',Math.min(xe+4,pB.l+pwB-58),pB.t+12);}
-if(fnull>=1&&fnull<=10000){const fx=xOf(fnull);c3.strokeStyle='#4a5878';c3.setLineDash([3,3]);c3.beginPath();c3.moveTo(fx,pB.t);c3.lineTo(fx,pB.t+phB);c3.stroke();c3.setLineDash([]);}}
-c3.fillStyle='#8b98ac';c3.font='9px system-ui';
-c3.fillText('1G',xOf(1)-3,pB.t+phB+11);c3.fillText('10G',xOf(10)-8,pB.t+phB+11);c3.fillText('100G',xOf(100)-11,pB.t+phB+11);c3.fillText('1T',xOf(1000)-4,pB.t+phB+11);c3.fillText('10T',xOf(10000)-12,pB.t+phB+11);
-c3.font='10px system-ui';c3.fillText('log f: reach up -> nulls slide left; baud up -> band widens',W3/2+54,H3-2);
-
-const wy=el._wy.getContext('2d');clear(wy,el._wy);
-wy.fillStyle='#e6edf3';wy.font='bold 13px system-ui';wy.fillText('6 ·  References (read in full)',12,20);
-wy.fillStyle='#f0a3a3';wy.font='11px system-ui';wy.fillText('Coherent / IM-DD power-fading NULL:',12,44);
-wy.fillStyle='#cdd6e4';wy.fillText('   US Patent 6,388,785   ·   Zhang et al., Opt. Express 33, 32675 (2025).',12,60);
-wy.fillStyle='#86e29a';wy.fillText('Incoherent → LOW-PASS  (microwave-photonic-filter literature):',12,84);
-wy.fillStyle='#cdd6e4';wy.fillText('   Yao, IEEE Microw. Mag., Sept. 2015, pp. 46-60   ·   Sancho et al., Nat. Commun. 3, 1075 (2012).',12,100);
-wy.fillStyle='#86e29a';wy.fillText('Incoherent FTM mechanism  h(t)=ΣS(λ)·δ(t−τ)  (spectrum mapped to time):',12,122);
-wy.fillStyle='#cdd6e4';wy.fillText('   Huh, PhD thesis, INRS-EMT (2018).',12,138);
-wy.fillStyle='#8b98ac';wy.font='10px system-ui';wy.fillText('Principle there: incoherent taps → all-positive → low-pass. Panel 5 applies it to a broadband LED.',12,160);
-
-
-      /* ---- 6: modal dispersion vs CD (step-index bundle, incoherent power-domain) ---- */
-      {const md=el._md.getContext('2d');clear(md,el._md);
-      const NAv=P.fibNA,n1=1.52,c0=299792458;
-      const Lm=Math.max(P.reach,0.01);
-      const dtauM=_modalSpreadPs(NAv,(P.fbAlpha===undefined?99:P.fbAlpha),Lm);
-      const sigCD=Math.max(P.Dcd*(Lm/1000)*P.dlam/2.355,0.02);
-      const rmsM=dtauM/Math.sqrt(12), rmsC=sigCD;
-      const Rb2=P.cdRb;
-      md.fillStyle='#e6edf3';md.font='bold 13px system-ui';md.fillText('1 \u00b7  Modal dispersion \u2014 h(t), the delay spread, and the low-pass it creates',12,16);
-      md.fillStyle='#8b98ac';md.font='10px system-ui';
-      md.fillText('ray-traced in n(r) = nco*sqrt(1-2*Delta*(r/a)^alpha).  Step (alpha=99): dtau = NA\u00b2 L/(2 n1 c), h(t) = rect.  Graded (alpha->2): delays equalise, dtau collapses.',12,32);
-      const Lx=40,Lw=320,Ly=44,Lh=130;md.strokeStyle='#25324e';md.strokeRect(Lx,Ly,Lw,Lh);
-      const span=Math.max(dtauM*1.3,10);
- 
-      const _dn=_modalDensity(NAv,(P.fbAlpha===undefined?99:P.fbAlpha),(P.th50===undefined?5.5:P.th50),Lm,90);
-      if(_dn){const mxb=Math.max.apply(null,Array.from(_dn.bins))||1;
-        const x0=Lx+((span/2-dtauM/2)/span)*Lw, xw=(dtauM/span)*Lw;
-        md.fillStyle='#e5c07b';
-        for(let i=0;i<_dn.NB;i++){const h=_dn.bins[i]/mxb*(Lh-14);
-          const bx=x0+i/_dn.NB*xw, bw=Math.max(xw/_dn.NB,0.7);
-          if(bx>=Lx&&bx<=Lx+Lw)md.fillRect(bx,Ly+Lh-4-h,bw,h);}}
-      /* axis labels: the vertical axis is the share of launched power arriving in that time
-         bin, the horizontal axis is arrival time measured from the fastest ray */
-      md.save();
-      md.translate(Lx-16,Ly+Lh/2);md.rotate(-Math.PI/2);
-      md.fillStyle='#8b98ac';md.font='9.5px system-ui';md.textAlign='center';
-      md.fillText('power per bin',0,0);
-      md.restore();
-      md.textAlign='left';md.font='10px system-ui';md.fillStyle='#8b98ac';
-      md.fillText('0',Lx-4,Ly+Lh+12);
-      md.fillText(span.toFixed(0)+' ps',Lx+Lw-34,Ly+Lh+12);
-      md.textAlign='center';
-      md.fillText('arrival time, from the fastest ray  (ps)',Lx+Lw/2,Ly+Lh+12);
-      md.textAlign='left';
-      md.fillStyle='#e5c07b';md.fillText('edge '+(Math.asin(Math.min(NAv,0.99))*180/Math.PI).toFixed(1)+'\u00b0 (5%,=NA)  theta50 '+((P.th50>=90)?'OFL':(P.th50.toFixed(1)+'\u00b0'))+'  alpha '+((P.fbAlpha===undefined?99:P.fbAlpha)>=90?'step':(P.fbAlpha).toFixed(2)),Lx,Ly+Lh+26);
-      
-      const Rx=432,Rw=282,Ry=44,Rh=130;md.strokeStyle='#25324e';md.strokeRect(Rx,Ry,Rw,Rh);
-      const _flCD=0.418/Math.max(sigCD*1e-12,1e-15)/1e9;const fmax=Math.max(1.5*Rb2,Math.min(_flCD,300)),dbB=-30;
-      md.fillStyle='rgba(88,166,255,0.10)';md.fillRect(Rx,Ry,(Rb2/fmax)*Rw,Rh);
-      const yD=db=>Ry+(0-Math.max(dbB,Math.min(0,db)))/(0-dbB)*Rh;
-      md.save();md.font='9px system-ui';
-      for(let db=0;db>=dbB;db-=5){const Y=yD(db);
-        md.strokeStyle=(db%10===0)?'#31405f':'#232f47';md.lineWidth=1;
-        md.beginPath();md.moveTo(Rx,Y);md.lineTo(Rx+Rw,Y);md.stroke();
-        if(db%10===0&&db!==0){md.fillStyle='#8b98ac';md.fillText(db,Rx-24,Y+3);}
-        if(db===0){md.fillStyle='#8b98ac';md.fillText('0 dB',Rx-30,Y+10);}}
-      {const _st=(fmax<=6)?1:(fmax<=15?2:(fmax<=40?5:20));
-       for(let fG=_st;fG<fmax;fG+=_st){const X=Rx+(fG/fmax)*Rw;
-         md.strokeStyle='#232f47';md.lineWidth=1;md.beginPath();md.moveTo(X,Ry);md.lineTo(X,Ry+Rh);md.stroke();
-         md.fillStyle='#66748c';md.fillText(String(fG),X-4,Ry+Rh+12);}}
-      {const _y3=yD(-3);md.strokeStyle='#ef4444';md.setLineDash([2,3]);md.lineWidth=1;
-       md.beginPath();md.moveTo(Rx,_y3);md.lineTo(Rx+Rw,_y3);md.stroke();md.setLineDash([]);
-       md.fillStyle='#ef4444';md.fillText('-3 dB',Rx+Rw+2,_y3+3);}
-      md.restore();md.strokeStyle='#25324e';md.lineWidth=1;md.strokeRect(Rx,Ry,Rw,Rh);
-      const cv=(fn,col)=>{md.strokeStyle=col;md.lineWidth=1.4;md.beginPath();for(let q=0;q<=140;q++){const fG=(q/140)*fmax;const db=fn(fG);const X=Rx+q/140*Rw,Y=yD(db);if(q===0)md.moveTo(X,Y);else md.lineTo(X,Y);}md.stroke();};
-      const Hm=f=>20*Math.log10(Math.max(_modalH(_dn,f),1e-4));
-      const Hc=f=>{const s2=sigCD*1e-12,w=2*Math.PI*Math.PI*s2*s2*f*f*1e18;return -8.6858896*w;};
-      cv(Hm,'#e5c07b');
-      md.strokeStyle='#4a5878';md.setLineDash([3,3]);md.beginPath();md.moveTo(Rx+(Rb2/fmax)*Rw,Ry);md.lineTo(Rx+(Rb2/fmax)*Rw,Ry+Rh);md.stroke();md.setLineDash([]);      md.fillStyle='#8b98ac';md.fillText('0',Rx-4,Ry+Rh+12);md.fillText('GHz',Rx+Rw+2,Ry+Rh+12);md.fillText('band edge',Rx+(Rb2/fmax)*Rw-24,Ry+Rh+24);
-      md.fillStyle='#e5c07b';md.fillText('|H_modal|  (3dB at '+(()=>{let lo=0.001,hi=5e4;for(let q=0;q<50;q++){const mid=Math.sqrt(lo*hi);if(_modalH(_dn,mid)>Math.SQRT1_2)lo=mid;else hi=mid;}const b=Math.sqrt(lo*hi);return b<1?(b*1000).toFixed(0)+' MHz':b.toFixed(1)+' GHz';})()+')',Rx,Ry+Rh+38);
-      md.fillStyle='#cbd5e1';
-      const spreadA=dtauM;const ratio=rmsM/Math.max(rmsC,1e-6);
-      const who=(ratio>1.5)?('MODAL dominates ('+ratio.toFixed(1)+'x rms of CD)'):(ratio<0.67?('CD dominates ('+(1/ratio).toFixed(1)+'x rms of modal)'):'comparable');
-      md.fillStyle='#f0a3a3';md.font='10px system-ui';
-      md.fillText('spread '+spreadA.toFixed(0)+' ps = '+(spreadA/(1000/Rb2)).toFixed(2)+' UI at '+Rb2+' Gbaud   |   rms '+(_dn?_dn.rmsPs.toFixed(1):'0')+' ps   |   step-index scales as NA\u00b2 L; graded (alpha near 2) collapses it.',12,Ry+Rh+56);
-      md.fillStyle='#8b98ac';
-      md.fillText('Incoherent: modes add in POWER (real mode distributions soften the sinc nulls). Coherent light here would get modal speckle noise instead.',12,Ry+Rh+70);}
-
-      }},
-fiber:{ctrls:()=>slider('reach','Fiber length (m)',0,100,1)+slider('Rb','Modulation baud (Gbaud)',1,12,0.5)+slider('fibNA','Fiber NA',0.05,0.5,0.01)+slider('fbAlpha','Profile alpha (2 = parabolic, 99 = step)',1.5,99,0.05)+slider('fbCoreR','Core radius (um)',5,40,1)+slider('fbClad','Cladding thickness (um)',1,40,1)+slider('fbLam','Wavelength (nm)',400,1600,10)+slider('th50','Launch half-angle at 50% (deg; 90 = overfilled)',2,90,0.5),
-  render(){const el=view();
-    if(!el._init){el.innerHTML='';const _WC=366;
-      el._fp=mkCanvas('fbp',236,_WC);el._ff=mkCanvas('fbf',236,_WC);el._fb=mkCanvas('fbb',236,_WC);el._fm=mkCanvas('fbm',236,_WC);
-      const _g1=document.createElement('div');_g1.className='fgrid';_g1.append(el._fp,el._ff);
-      const _g2=document.createElement('div');_g2.className='fgrid';_g2.append(el._fb,el._fm);
-      el.append(_g1,_g2);el._it=mkCanvas('fbisi',150);el.append(el._it);
-      el.insertAdjacentHTML('beforeend','<div class="metrics" id="mfb"></div><p class="note">Meridional ray model in a power-law profile n(r)=nco*sqrt(1-2*Delta*(r/a)^alpha), cladding index fixed at 1.457 (fused silica). Rays are launched uniformly in solid angle up to the acceptance angle and integrated exactly, so the delay histogram is computed, not assumed. Mode count uses the generalized RP-Photonics rule M = (pi/lam^2) * integral (n^2 - ncl^2) dA over the core, counting both polarizations. The ISI-tap chart is the sampled pulse response of a 1-UI rectangular pulse through the delay kernel: each tap is the launch-weighted delay mass in one unit-interval bin. The sampling phase is scanned across one UI and set where the main cursor is largest - the eye centre a clock-recovery loop would lock near - rather than at the mean delay, which mis-centres asymmetric kernels. A centered modal kernel splits its ISI symmetrically into pre- and post-cursor mass; energy beyond \u00b13 UI is reported separately. Skew rays and profile dispersion (alpha_opt drifting with wavelength) are NOT modeled, so the alpha minimum here sits slightly below 2 and the parabolic case is optimistic.</p>');
-      el._init=1;}
-    const NCL=1.457, C0=299792458;
-    const alpha=P.fbAlpha, aR=P.fbCoreR*1e-6, clad=P.fbClad, NA=P.fibNA, lam=P.fbLam*1e-9, L=P.reach;
-    const nco=Math.sqrt(NCL*NCL+NA*NA), DEL=(nco*nco-NCL*NCL)/(2*nco*nco);
-    const nOf=u=>nco*Math.sqrt(Math.max(1-2*DEL*Math.pow(Math.min(u,1),alpha),NCL*NCL/(nco*nco)));
-    /* ---- ray delay per unit length ---- */
-    const delayOf=th=>{const beta=nco*Math.cos(th);
-      const s=(1-Math.pow(beta/nco,2))/(2*DEL);
-      if(s<=0)return nco/C0;
-      const rt=Math.pow(s,1/alpha);
-      if(rt>1)return null;
-      let Lz=0,Tt=0,N=420;
-      for(let i=0;i<N;i++){const r=(i+0.5)/N*rt,n=nOf(r),num=n*n-beta*beta;
-        if(num<=0)continue;const dr=rt/N;
-        Lz+=beta/Math.sqrt(num)*dr;Tt+=n*n/(C0*Math.sqrt(num))*dr;}
-      return Lz>0?Tt/Lz:nco/C0;};
-    const thMax=Math.asin(Math.min(NA/nco,0.999)), NR=220, rays=[];
-    for(let i=0;i<NR;i++){const th=(i+0.5)/NR*thMax,t=delayOf(th);
-      if(t!==null){const _t5=(P.th50===undefined?5.5:P.th50),_sg=(_t5*Math.PI/180)/1.17741;
-        rays.push({th,w:Math.sin(th)*Math.cos(th)*((_t5>=90)?1:Math.exp(-(th*th)/(2*_sg*_sg))),t});}}
-    const W=rays.reduce((s,r)=>s+r.w,0);
-    const tmin=Math.min(...rays.map(r=>r.t)),tmax=Math.max(...rays.map(r=>r.t));
-    const mean=rays.reduce((s,r)=>s+r.w*r.t,0)/W;
-    const rms=Math.sqrt(rays.reduce((s,r)=>s+r.w*(r.t-mean)*(r.t-mean),0)/W);
-    const spreadPs=(tmax-tmin)*1e12*L, rmsPs=rms*1e12*L;
-    const Hm=fG=>{let re=0,im=0;for(const r of rays){const ph=-2*Math.PI*fG*1e9*(r.t-mean)*L;re+=r.w*Math.cos(ph);im+=r.w*Math.sin(ph);}return Math.hypot(re,im)/W;};
-    let lo=1e-4,hi=5e4;for(let k=0;k<60;k++){const mid=Math.sqrt(lo*hi);if(Hm(mid)>Math.SQRT1_2)lo=mid;else hi=mid;}
-    const bw3=Math.sqrt(lo*hi);
-    /* ---- mode count: M = (pi/lam^2) * int (n^2 - ncl^2) dA, both polarizations ---- */
-    let integ=0;const NI=600;
-    for(let i=0;i<NI;i++){const u=(i+0.5)/NI,r=u*aR,n=nOf(u);integ+=(n*n-NCL*NCL)*2*Math.PI*r*(aR/NI);}
-    const M1pol=Math.max(0,Math.round(Math.PI/(lam*lam)*integ));const Mmodes=M1pol*2;
-    const V=2*Math.PI/lam*aR*NA;
-    const _n2=r=>{const u=r/aR;if(u>=1)return NCL*NCL;return nco*nco*(1-2*DEL*Math.pow(u,alpha));};
-    const kk=2*Math.PI/lam;
-    const _inCore=(l,beta,N)=>{
-      const dr=aR/N,psi=new Float64Array(N+1);
-      let p=(l===0)?1:Math.pow(dr,l), dp=(l===0)?0:l*Math.pow(dr,l-1);
-      psi[1]=p;
-      const f=(r,p,dp)=>-dp/r-(kk*kk*_n2(r)-beta*beta-(l*l)/(r*r))*p;
-      for(let i=1;i<N;i++){const ri=i*dr;
-        const a1=dp,b1=f(ri,p,dp);
-        const a2=dp+0.5*dr*b1,b2=f(ri+0.5*dr,p+0.5*dr*a1,dp+0.5*dr*b1);
-        const a3=dp+0.5*dr*b2,b3=f(ri+0.5*dr,p+0.5*dr*a2,dp+0.5*dr*b2);
-        const a4=dp+dr*b3,b4=f(ri+dr,p+dr*a3,dp+dr*b3);
-        p+=dr/6*(a1+2*a2+2*a3+a4);dp+=dr/6*(b1+2*b2+2*b3+b4);
-        if(Math.abs(p)>1e120){const sc=1e-120;p*=sc;dp*=sc;for(let q=0;q<=i;q++)psi[q]*=sc;}
-        psi[i+1]=p;}
-      return {psi,p,dp,dr,N,D:dp/p};};
-    const _cladD=(l,beta,NC=500)=>{
-      const g2=beta*beta-kk*kk*NCL*NCL; if(g2<=0)return null;
-      const gam=Math.sqrt(g2), rOut=aR+Math.max(9/gam,aR*0.4);
-      let p=1,dp=-(gam+0.5/rOut),r=rOut;
-      const h=-(rOut-aR)/NC;
-      const f=(r,p,dp)=>-dp/r+(gam*gam+(l*l)/(r*r))*p;
-      for(let i=0;i<NC;i++){
-        const a1=dp,b1=f(r,p,dp);
-        const a2=dp+0.5*h*b1,b2=f(r+0.5*h,p+0.5*h*a1,dp+0.5*h*b1);
-        const a3=dp+0.5*h*b2,b3=f(r+0.5*h,p+0.5*h*a2,dp+0.5*h*b2);
-        const a4=dp+h*b3,b4=f(r+h,p+h*a3,dp+h*b3);
-        p+=h/6*(a1+2*a2+2*a3+a4);dp+=h/6*(b1+2*b2+2*b3+b4);r+=h;
-        if(Math.abs(p)>1e120){const sc=1e-120;p*=sc;dp*=sc;}}
-      return {D:dp/p,gam,p,dp};};
-    const _corePsi=(l,beta,N,co)=>{
-      const dr=aR/N;
-      const Q=r=>kk*kk*_n2(r)-beta*beta-(l*l)/(r*r);
-      let rt=aR;
-      for(let i=N;i>=1;i--){const r=i*dr;if(Q(r)>0){rt=r;break;}}
-      const f=(r,p,dp)=>-dp/r-Q(r)*p;
-      const step=(r,p,dp,h)=>{
-        const a1=dp,b1=f(r,p,dp);
-        const a2=dp+0.5*h*b1,b2=f(r+0.5*h,p+0.5*h*a1,dp+0.5*h*b1);
-        const a3=dp+0.5*h*b2,b3=f(r+0.5*h,p+0.5*h*a2,dp+0.5*h*b2);
-        const a4=dp+h*b3,b4=f(r+h,p+h*a3,dp+h*b3);
-        return [p+h/6*(a1+2*a2+2*a3+a4), dp+h/6*(b1+2*b2+2*b3+b4)];};
-      const psi=new Float64Array(N+1);
-      /* outward 0 -> rt : oscillatory region, stable */
-      let p=(l===0)?1:Math.pow(dr,l), dp=(l===0)?0:l*Math.pow(dr,l-1);
-      psi[0]=(l===0)?1:0;psi[1]=p;
-      let iT=Math.max(1,Math.min(N,Math.round(rt/dr)));
-      for(let i=1;i<iT;i++){const r=i*dr;const o=step(r,p,dp,dr);p=o[0];dp=o[1];psi[i+1]=p;}
-      const pOut=p;
-      if(iT<N){
-        /* inward aR -> rt : evanescent region, the decaying-outward branch is the
-           growing-inward one, so integrating backwards is the stable direction */
-        let q=co.p, dq=co.dp;
-        const tmp=new Float64Array(N+1);tmp[N]=q;
-        for(let i=N;i>iT;i--){const r=i*dr;const o=step(r,q,dq,-dr);q=o[0];dq=o[1];tmp[i-1]=q;}
-        const sc=(Math.abs(q)>1e-300)?(pOut/q):0;
-        for(let i=iT;i<=N;i++)psi[i]=tmp[i]*sc;
-      }
-      let mx=0;for(let i=0;i<=N;i++)mx=Math.max(mx,Math.abs(psi[i]));
-      if(mx>0)for(let i=0;i<=N;i++)psi[i]/=mx;
-      return {psi,N,dr,rt};};
-    const _mism=(l,beta,N)=>{const co=_cladD(l,beta);if(!co)return null;
-      const ci=_inCore(l,beta,N);
-      /* normalized Wronskian: bounded, zero exactly at a mode, no poles (log-derivative has poles) */
-      const s1=Math.hypot(ci.p,ci.dp*aR)||1, s2=Math.hypot(co.p,co.dp*aR)||1;
-      const v=(ci.p/s1)*(co.dp*aR/s2)-(ci.dp*aR/s1)*(co.p/s2);
-      return isFinite(v)?{v,ci,co}:null;};
-    const _findMode=(l,mWant,coarse)=>{
-      const N=coarse?300:Math.max(500,Math.min(1200,Math.round(aR/(lam/(12*nco)))));
-      const bmax=kk*nco*(1-1e-13),bmin=kk*NCL*(1+1e-10),NS=coarse?180:420;
-      let prev=null,prevB=null,found=0;
-      for(let i=0;i<=NS;i++){
-        const beta=bmax-(bmax-bmin)*i/NS,r=_mism(l,beta,N);
-        if(!r){prev=null;continue;}
-        if(prev!==null&&((r.v>0)!==(prev>0))){
-          found++;
-          if(found===mWant){let lo=prevB,hi=beta,flo=prev;
-            for(let q=0;q<60;q++){const mid=0.5*(lo+hi),rm=_mism(l,mid,N);if(!rm)break;
-              if((rm.v>0)===(flo>0)){lo=mid;flo=rm.v;}else hi=mid;}
-            const bb=0.5*(lo+hi),rr=_mism(l,bb,N);
-            if(!rr)return null;
-            /* build psi(r) on a plotting grid: core from integration, cladding = decaying tail */
-            const rmaxP=aR*1.5,NP=520,rr_=new Float64Array(NP),pp=new Float64Array(NP);
-            const _cp=_corePsi(l,bb,N,rr.co);
-            const pa=_cp.psi[_cp.N];
-            for(let q=0;q<NP;q++){const r=(q+0.5)/NP*rmaxP;rr_[q]=r;
-              if(r<=aR){const idx=Math.min(_cp.N,Math.round(r/_cp.dr));pp[q]=_cp.psi[idx];}
-              else pp[q]=pa*Math.exp(-rr.co.gam*(r-aR))*Math.sqrt(aR/r);}
-            let mx=0;for(let q=0;q<NP;q++)mx=Math.max(mx,Math.abs(pp[q]));
-            if(mx>0)for(let q=0;q<NP;q++)pp[q]/=mx;
-            return {beta:bb,neff:bb/kk,r:rr_,psi:pp,NP,rmaxP,gam:rr.co.gam};}}
-        prev=r.v;prevB=beta;}
-      return null;};
-    const _J=(n,x)=>{if(x<0)return(n%2===0)?_J(n,-x):-_J(n,-x);
-      if(x<14){let s=0,ft=1,fn=1;for(let q=1;q<=n;q++)fn*=q;
-        for(let k2=0;k2<40;k2++){if(k2>0){ft*=k2;fn*=(k2+n);}
-          const t=Math.pow(-1,k2)/(ft*fn)*Math.pow(x/2,2*k2+n);s+=t;if(Math.abs(t)<1e-17)break;}
-        return s;}
-      return Math.sqrt(2/(Math.PI*x))*Math.cos(x-n*Math.PI/2-Math.PI/4);};
-    const _farField=(l,md,NTH=150)=>{const thM=Math.min(Math.asin(Math.min(NA*2.5,0.95)),0.6),out=[];
-      const dr=md.rmaxP/md.NP;
-      for(let j=0;j<NTH;j++){const th=(j+0.5)/NTH*thM,kt=kk*Math.sin(th);let acc=0;
-        for(let i=0;i<md.NP;i++)acc+=md.psi[i]*_J(l,kt*md.r[i])*md.r[i]*dr;
-        out.push({th,amp:acc});}
-      return {ff:out,thM};};
-    const _hiKey=NA.toFixed(4)+'|'+alpha.toFixed(2)+'|'+aR.toFixed(9)+'|'+lam.toFixed(12);
-    if(!globalThis._hiCache)globalThis._hiCache={};
-    let _hi=globalThis._hiCache[_hiKey];
-    if(_hi===undefined){
-      let lTry=Math.max(1,Math.floor(V-1.9*Math.cbrt(Math.max(V,1))));
-      _hi=null;
-      for(let q=0;q<14&&lTry>=1;q++){const m=_findMode(lTry,1,true);
-        if(m){const full=_findMode(lTry,1);_hi={l:lTry,md:full||m};break;}
-        lTry=Math.max(1,Math.floor(lTry*0.82));}
-      globalThis._hiCache[_hiKey]=_hi;
-    }
-    const mL=_hi?_hi.l:1, mM=1;
-    if(!globalThis._m0Cache)globalThis._m0Cache={};
-    let md0=globalThis._m0Cache[_hiKey];
-    if(md0===undefined){md0=_findMode(0,1);globalThis._m0Cache[_hiKey]=md0;}
-    const mdX=_hi?_hi.md:null;
-    const thNA=Math.asin(Math.min(NA,0.95));
-    const _pwrBeyond=(l,md)=>{const F=_farField(l,md);let tot=0,out=0;
-      for(const p of F.ff){const I=p.amp*p.amp*Math.sin(p.th);tot+=I;if(p.th>thNA)out+=I;}
-      return {frac:tot>0?out/tot:0,F};};
-    if(!globalThis._ffCache)globalThis._ffCache={};
-    const _ffKey=_hiKey+'|'+NA.toFixed(4);
-    let _ffc=globalThis._ffCache[_ffKey];
-    if(_ffc===undefined){_ffc={a:md0?_pwrBeyond(0,md0):null,b:mdX?_pwrBeyond(mL,mdX):null};globalThis._ffCache[_ffKey]=_ffc;}
-    const r0=_ffc.a, rX=_ffc.b;
-    const _X=42,_W=306,_Y=34;
-    /* ---- panel 1: index profile ---- */
-    {const g=el._fp.getContext('2d');clear(g,el._fp);
-     g.fillStyle='#e6edf3';g.font='bold 12px system-ui';
-     g.fillText('1 \u00b7 Index profile n(r)',12,15);
-     g.fillStyle='#8b98ac';g.font='9px system-ui';
-     g.fillText('core radius '+P.fbCoreR+' um, cladding '+clad+' um, alpha '+(alpha>=90?'step':alpha.toFixed(2)),12,27);
-     const X=_X,Y=_Y+10,Wd=_W,Ht=140;g.strokeStyle='#25324e';g.strokeRect(X,Y,Wd,Ht);
-     const rTot=P.fbCoreR+clad, nmin=NCL-0.002, nmax=nco+0.002;
-     const px=r=>X+Wd/2+(r/rTot)*(Wd/2), py=n=>Y+Ht-((n-nmin)/(nmax-nmin))*(Ht-8)-4;
-     g.fillStyle='rgba(88,166,255,0.08)';g.fillRect(px(-P.fbCoreR),Y,px(P.fbCoreR)-px(-P.fbCoreR),Ht);
-     g.strokeStyle='#3fb950';g.lineWidth=1.8;g.beginPath();
-     for(let i=0;i<=400;i++){const r=-rTot+i/400*2*rTot,ar=Math.abs(r);
-       const n=(ar<=P.fbCoreR)?nOf(ar/P.fbCoreR):NCL;const Xp=px(r),Yp=py(n);
-       if(i===0)g.moveTo(Xp,Yp);else g.lineTo(Xp,Yp);}
-     g.stroke();
-     g.strokeStyle='#4a5878';g.setLineDash([3,3]);g.beginPath();g.moveTo(X,py(NCL));g.lineTo(X+Wd,py(NCL));g.stroke();g.setLineDash([]);
-     g.fillStyle='#8b98ac';g.font='9px system-ui';
-     g.fillText('n_cl '+NCL.toFixed(3),X+3,py(NCL)-3);
-     g.fillText('n_co '+nco.toFixed(4),X+3,py(nco)+11);
-     g.fillText('-'+rTot,X,Y+Ht+12);g.fillText('0',X+Wd/2-2,Y+Ht+12);g.fillText(rTot+' um',X+Wd-30,Y+Ht+12);
-     g.fillStyle='#e5c07b';
-     g.fillText('Delta '+(DEL*100).toFixed(3)+'%   V '+V.toFixed(1)+'   modes ~'+Mmodes+' (both pol.)',X,Y+Ht+26);
+function _modalSpreadPs(NA,alpha,reachM){
+  if(!(NA>0)||!(reachM>0))return 0;
+  const NCL=1.457,C0=299792458;
+  const nco=Math.sqrt(NCL*NCL+NA*NA),DEL=(nco*nco-NCL*NCL)/(2*nco*nco);
+  const nOf=u=>nco*Math.sqrt(Math.max(1-2*DEL*Math.pow(Math.min(u,1),alpha),1e-9));
+  const delayOf=th=>{const beta=nco*Math.cos(th);
+    const sq=(1-Math.pow(beta/nco,2))/(2*DEL);
+    if(sq<=0)return nco/C0;
+    const rt=Math.pow(sq,1/alpha); if(rt>1)return null;
+    let Lz=0,Tt=0;const N=260,dr=rt/N;
+    for(let i=0;i<N;i++){const r=(i+0.5)/N*rt,n=nOf(r),num=n*n-beta*beta;
+      if(num<=0)continue;const sr=Math.sqrt(num);
+      Lz+=beta/sr*dr;Tt+=n*n/(C0*sr)*dr;}
+    return Lz>0?Tt/Lz:nco/C0;};
+  const thMax=Math.asin(Math.min(NA/nco,0.999));let t0=1e9,t1=-1e9;
+  for(let i=0;i<140;i++){const t=delayOf((i+0.5)/140*thMax);if(t===null)continue;
+    t0=Math.min(t0,t);t1=Math.max(t1,t);}
+  return (t1-t0)*reachM*1e12;
 }
 
-    /* ---- panel 2: far-field intensity maps (LP01 and highest-order) ---- */
-    {const g=el._ff.getContext('2d');clear(g,el._ff);
-     g.fillStyle='#e6edf3';g.font='bold 12px system-ui';
-     g.fillText('2 \u00b7 Far-field intensity',12,15);
-     g.fillStyle='#8b98ac';g.font='9px system-ui';
-     g.fillText('fundamental LP01 vs highest-order LP'+mL+',1 \u2014 circle marks the NA limit',12,27);
-     const AMAX=14, MS=138, y0=42, x1=30, x2=x1+MS+30;
-     /* colour ramp: dark blue -> cyan -> green -> yellow -> red (RP-like) */
-     const ramp=v=>{v=Math.max(0,Math.min(1,v));
-       const st=[[0.00,8,12,60],[0.18,20,80,180],[0.38,40,190,190],[0.58,90,210,90],[0.78,245,215,70],[1.00,220,50,40]];
-       for(let i=1;i<st.length;i++){if(v<=st[i][0]||i===st.length-1){
-         const a=st[i-1],b=st[i],t=(v-a[0])/((b[0]-a[0])||1);
-         return [a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t, a[3]+(b[3]-a[3])*t];}}
-       return [220,50,40];};
-     const drawMap=(R,l,ox,label)=>{
-       g.strokeStyle='#25324e';g.strokeRect(ox,y0,MS,MS);
-       if(!R){g.fillStyle='#66748c';g.font='9px system-ui';g.fillText('not guided',ox+MS/2-24,y0+MS/2);return;}
-       const ff=R.F.ff, thMaxRad=AMAX*Math.PI/180;
-       const amp=t=>{ if(t>=ff[ff.length-1].th) return 0;
-         const q=t/ff[ff.length-1].th*(ff.length-1), i0=Math.floor(q), fr=q-i0;
-         const a=ff[Math.min(i0,ff.length-1)].amp, b=ff[Math.min(i0+1,ff.length-1)].amp;
-         return a+(b-a)*fr; };
-       if(!globalThis._mapCache)globalThis._mapCache={};
-       const _mk=_ffKey+'|'+l+'|'+MS+'|'+AMAX;
-       if(globalThis._mapCache[_mk]){g.drawImage(globalThis._mapCache[_mk],ox,y0,MS,MS);}else{
-       const _off=document.createElement('canvas');_off.width=MS;_off.height=MS;
-       const _oc=_off.getContext('2d');
-       const img=_oc.createImageData(MS,MS), d=img.data;
-       let mx=0; const buf=new Float64Array(MS*MS);
-       const SS=3;
-       for(let py=0;py<MS;py++)for(let px=0;px<MS;px++){
-         let acc=0,nIn=0;
-         for(let sy=0;sy<SS;sy++)for(let sx=0;sx<SS;sx++){
-           const ax=(((px+(sx+0.5)/SS)/MS)*2-1)*AMAX, ay=(1-((py+(sy+0.5)/SS)/MS)*2)*AMAX;
-           const th=Math.hypot(ax,ay)*Math.PI/180;
-           if(th>thMaxRad)continue;
-           const phi=Math.atan2(ay,ax), A=amp(th);
-           acc+=A*A*(l===0?1:Math.pow(Math.cos(l*phi),2));nIn++;}
-         if(nIn===0){buf[py*MS+px]=-1;continue;}
-         const I=acc/(SS*SS);
-         buf[py*MS+px]=I; if(I>mx)mx=I;}
-       for(let i=0;i<MS*MS;i++){
-         const v=buf[i];const o=i*4;
-         if(v<0){d[o]=10;d[o+1]=17;d[o+2]=35;d[o+3]=255;continue;}
-         const c=ramp(mx>0?Math.sqrt(v/mx):0);
-         d[o]=c[0];d[o+1]=c[1];d[o+2]=c[2];d[o+3]=255;}
-       _oc.putImageData(img,0,0);
-       g.drawImage(_off,ox,y0,MS,MS);globalThis._mapCache[_mk]=_off;}
-       /* NA circle */
-       const rNA=(thNA*180/Math.PI)/AMAX*(MS/2);
-       g.strokeStyle='rgba(255,255,255,0.85)';g.lineWidth=1.2;
-       g.beginPath();g.arc(ox+MS/2,y0+MS/2,Math.min(rNA,MS/2),0,2*Math.PI);g.stroke();
-       g.strokeStyle='#25324e';g.lineWidth=1;g.strokeRect(ox,y0,MS,MS);
-       g.fillStyle='#ffffff';g.font='bold 10px system-ui';g.fillText(label,ox+3,y0-4);
-       g.fillStyle='#e5c07b';g.font='bold 9px system-ui';
-       g.fillText((R.frac*100).toFixed(1)+'% past NA',ox+3,y0+MS+11);};
-     drawMap(r0,0,x1,'LP01');
-     drawMap(rX,mL,x2,'LP'+mL+',1');
-     g.fillStyle='#8b98ac';g.font='9px system-ui';
-     g.fillStyle='#66748c';
-     g.fillText('-'+AMAX,x1-4,y0+MS+22);g.fillText('+'+AMAX+'\u00b0',x1+MS-14,y0+MS+22);
-     g.fillText('-'+AMAX,x2-4,y0+MS+22);g.fillText('+'+AMAX+'\u00b0',x2+MS-14,y0+MS+22);
-     g.save();g.translate(14,y0+MS/2+18);g.rotate(-Math.PI/2);
-     g.fillText('y angle',0,0);g.restore();
-     g.fillStyle='#8b98ac';
-     g.fillText('x angle  \u2014  white circle = NA limit '+(thNA*180/Math.PI).toFixed(1)+'\u00b0'+(mL>6?'   ('+(2*mL)+' azimuthal lobes)':''),x1,y0+MS+33);}
+const PROB=[
+ {k:'pwr', name:'Power / sensitivity', c:'#e5c07b', hit:['drv','led','txl','rxl','pd'],
+  what:'How many photons reach the decision point. It sets the noise floor everything else is measured against.',
+  from:'LED output, coupling into the core, fibre attenuation, RX lens capture and PD fill.',
+  knob:'LED optical OMA, PD diameter, lens pitch, DTI height and reflectivity, IRN.'},
+ {k:'cd', name:'Chromatic dispersion', c:'#ef4444', hit:['led','fib'],
+  what:'The LED emits a band of wavelengths and each travels at its own speed, so the pulse spreads.',
+  from:'Source linewidth times fibre dispersion times length. Linear in both linewidth and length.',
+  knob:'Delta-lambda FWHM, CD at 430 nm, reach. A narrow-band emitter is the only real lever.'},
+ {k:'modal', name:'Modal dispersion', c:'#3fb950', hit:['txl','fib'],
+  what:'Rays launched at different angles take different path lengths down the core.',
+  from:'The launch angle distribution and the index profile together, not the fibre alone.',
+  knob:'Fibre profile alpha, launch half-angle, bundle NA, reach. A graded profile is the big lever.'},
+ {k:'ext', name:'Electrical crosstalk', c:'#c58af9', hit:['pd','tia'],
+  what:'Neighbouring lanes couple into this lane at the PD to TIA input node.',
+  from:'Node pitch, substrate and metal coupling, how many neighbours are active, and the baud rate.',
+  knob:'PD and lens pitch, neighbour count, and a 2-PD differential front end with its CMRR.'},
+ {k:'oxt', name:'Optical crosstalk', c:'#22d3ee', hit:['rxl','pd'],
+  what:'Light from a neighbouring lens spills onto this photodiode.',
+  from:'Beam diameter at the detector plane against the lens pitch, and how much the DTI shields.',
+  knob:'PD diameter, lens pitch, PD standoff, DTI height and reflectivity, neighbour count.'},
+ {k:'led', name:'Component bandwidth ISI', c:'#fb923c', hit:['drv','led','pd','tia'],
+  what:'Every electro-optical stage has finite bandwidth, so each bit leaks into the next one.',
+  from:'Driver slew, LED carrier lifetime and its slow L-I tail, PD transit time, TIA bandwidth. The LED tail is causal, so it lands on the post-cursor.',
+  knob:'Drive current and emitter area, which set the LED 3 dB point through the S21-vs-J curve, plus RX bandwidth, TX pre-emphasis and RX DFE. A LUT does not help with a causal tail.'}];
+const PCAP={
+ pwr:{drv:'swing, bias',led:'OMA, WPE',txl:'coupling, NA fit',rxl:'capture, cover',pd:'fill, DTI, responsivity'},
+ cd:{led:'linewidth \u0394\u03bb',fib:'D at 430 nm, length'},
+ modal:{txl:'launch \u03b8\u2085\u2080',fib:'profile \u03b1, NA, length'},
+ ext:{pd:'node pitch, neighbours',tia:'__EXT_TIA__'},
+ oxt:{rxl:'lens pitch, standoff',pd:'PD diameter, DTI'},
+ led:{drv:'slew, pre-emph',led:'drive current, area',pd:'transit time',tia:'RX BW'}};
+const PBLK=[{k:'drv',lab:'Driver',x:18,w:80},{k:'led',lab:'LED',x:116,w:70},
+ {k:'txl',lab:'TX lens',x:204,w:78},{k:'fib',lab:'Fibre',x:300,w:150},
+ {k:'rxl',lab:'RX lens',x:468,w:78},{k:'pd',lab:'PD',x:564,w:60},{k:'tia',lab:'TIA',x:642,w:70}];
 
-    /* ---- panel 3: modal transfer function ---- */
-    {const g=el._fb.getContext('2d');clear(g,el._fb);
-     g.fillStyle='#e6edf3';g.font='bold 12px system-ui';
-     g.fillText('3 \u00b7 Modal transfer |H(f)| over '+L+' m',12,15);
-     g.fillStyle='#8b98ac';g.font='9px system-ui';
-     g.fillText('from the ray delays, launch-weighted \u2014 3 dB at '+(bw3<1?(bw3*1000).toFixed(0)+' MHz':bw3.toFixed(2)+' GHz'),12,27);
-     const X=_X,Y=_Y+10,Wd=_W,Ht=140;g.strokeStyle='#25324e';g.strokeRect(X,Y,Wd,Ht);
-     const fmx=Math.max(bw3*4,0.5),dbB=-30;
-     const yD=db=>Y+(0-Math.max(dbB,Math.min(0,db)))/(0-dbB)*Ht;
-     for(let db=0;db>=dbB;db-=5){const Yy=yD(db);
-       g.strokeStyle=(db%10===0)?'#31405f':'#232f47';g.lineWidth=1;
-       g.beginPath();g.moveTo(X,Yy);g.lineTo(X+Wd,Yy);g.stroke();
-       if(db%10===0&&db!==0){g.fillStyle='#8b98ac';g.font='9px system-ui';g.fillText(String(db),X-22,Yy+3);}}
-     g.fillStyle='#8b98ac';g.font='9px system-ui';g.fillText('0 dB',X-26,yD(0)+9);
-     {const _raw=fmx/7,_pow=Math.pow(10,Math.floor(Math.log10(_raw)));
-      const _m=_raw/_pow,st=_pow*(_m<1.5?1:(_m<3.5?2:(_m<7.5?5:10)));
-      for(let fG=st;fG<fmx;fG+=st){const Xp=X+(fG/fmx)*Wd;
-        g.strokeStyle='#232f47';g.beginPath();g.moveTo(Xp,Y);g.lineTo(Xp,Y+Ht);g.stroke();
-        if(fG<0.88*fmx){g.fillStyle='#66748c';g.fillText(String(Math.round(fG*100)/100),Xp-5,Y+Ht+12);}}}
-     {const y3=yD(-3);g.strokeStyle='#ef4444';g.setLineDash([2,3]);
-      g.beginPath();g.moveTo(X,y3);g.lineTo(X+Wd,y3);g.stroke();g.setLineDash([]);
-      g.fillStyle='#ef4444';g.fillText('-3',X+Wd+2,y3+3);}
-     g.strokeStyle='#e5c07b';g.lineWidth=1.6;g.beginPath();
-     for(let q=0;q<=160;q++){const fG=q/160*fmx,db=20*Math.log10(Math.max(Hm(fG),1e-4));
-       const Xp=X+q/160*Wd,Yp=yD(db);if(q===0)g.moveTo(Xp,Yp);else g.lineTo(Xp,Yp);}
-     g.stroke();
-     g.strokeStyle='#25324e';g.lineWidth=1;g.strokeRect(X,Y,Wd,Ht);
-     g.fillStyle='#8b98ac';g.fillText('0',X-3,Y+Ht+12);g.fillText('GHz',X+Wd-18,Y+Ht+12);
-     g.fillStyle='#e5c07b';g.fillText('BW x length = '+(bw3*L).toFixed(1)+' GHz\u00b7m',X,Y+Ht+26);}
-
-    /* ---- panel 4: radial mode intensity ---- */
-    {const g=el._fm.getContext('2d');clear(g,el._fm);
-     g.fillStyle='#e6edf3';g.font='bold 12px system-ui';
-     g.fillText('4 \u00b7 Radial mode intensity |psi(r)|\u00b2',12,15);
-     g.fillStyle='#8b98ac';g.font='9px system-ui';
-     g.fillText('LP01 (n_eff '+(md0?md0.neff.toFixed(5):'-')+')  vs  LP'+mL+',1 (n_eff '+(mdX?mdX.neff.toFixed(5):'not guided')+')',12,27);
-     const X=_X,Y=_Y+10,Wd=_W,Ht=140;g.strokeStyle='#25324e';g.strokeRect(X,Y,Wd,Ht);
-     const rmaxP=aR*1.5, px=r=>X+(r/rmaxP)*Wd;
-     g.fillStyle='rgba(88,166,255,0.08)';g.fillRect(X,Y,px(aR)-X,Ht);
-     const draw=(md,col)=>{if(!md)return;
-       g.strokeStyle=col;g.lineWidth=1.6;g.beginPath();
-       for(let i=0;i<md.NP;i++){const I=md.psi[i]*md.psi[i], Xp=px(md.r[i]), Yp=Y+Ht-4-I*(Ht-12);
-         if(i===0)g.moveTo(Xp,Yp);else g.lineTo(Xp,Yp);}
-       g.stroke();};
-     draw(md0,'#3fb950');draw(mdX,'#e5c07b');
-     g.strokeStyle='#4a5878';g.setLineDash([3,3]);g.beginPath();g.moveTo(px(aR),Y);g.lineTo(px(aR),Y+Ht);g.stroke();g.setLineDash([]);
-     g.fillStyle='#8b98ac';g.font='9px system-ui';
-     g.fillText('0',X-3,Y+Ht+12);g.fillText('core edge',px(aR)-24,Y+Ht+12);
-     g.fillText((rmaxP*1e6).toFixed(0)+' um',X+Wd-30,Y+Ht+12);
-     g.fillStyle='#3fb950';g.fillText('LP01',X,Y+Ht+26);
-     g.fillStyle='#e5c07b';g.fillText('LP'+mL+',1 (highest order)',X+52,Y+Ht+26);
-     g.fillStyle='#8b98ac';g.fillText('near-cutoff mode hugs the edge',X+178,Y+Ht+26);}
-
-    {/* ---- ISI taps of the unequalized fiber-only channel ----
-     Taps = sampled pulse response of a 1-UI rectangular pulse through the delay kernel:
-     p(kUI+t0) = weighted delay mass in ((k-0.5)UI, (k+0.5)UI) around sampling phase t0.
-     t0 is chosen to maximize the main cursor (the decision phase a CDR would lock near),
-     scanned over one UI - NOT simply the mean delay, which mis-centres asymmetric kernels. */
-     const UIps=1000/Math.max(P.Rb,0.1);
-     const binsAt=t0=>{const b=[0,0,0,0,0,0,0];let out=0;
-       for(const r of rays){const dps=(r.t-mean)*1e12*L-t0;const k=Math.round(dps/UIps);
-         if(k>=-3&&k<=3)b[k+3]+=r.w;else out+=r.w;}
-       return {b,out};};
-     let t0=0,bestC=-1;
-     for(let q=-20;q<=20;q++){const tt=q/40*UIps;const m0=binsAt(tt).b[3];if(m0>bestC){bestC=m0;t0=tt;}}
-     const _bb=binsAt(t0), taps=_bb.b.map(v=>v/W), resid=_bb.out/W;
-     const h0=Math.max(taps[3],1e-9);
-     const g=el._it.getContext('2d');clear(g,el._it);
-     g.fillStyle='#8bb7f0';g.font='bold 12px system-ui';
-     g.fillText('ISI taps at the decision point (unequalized fiber channel, 1-UI pulse; sampling phase = eye centre, '+t0.toFixed(0)+' ps from mean delay)',12,15);
-     const X=46,Y=26,Wd=el._it._w-90,Ht=el._it._h-56,bw=Wd/8;
-     g.strokeStyle='#25324e';g.strokeRect(X,Y,Wd,Ht);
-     const lbl=['h-3','h-2','h-1','h+0','h+1','h+2','h+3'];
-     for(let q=0;q<7;q++){const v=taps[q]/h0,xx=X+bw*(q+0.55);
-       const hh=Math.min(1,v)*(Ht-6);
-       g.fillStyle=(q===3)?'#3fb950':(q<3?'#e879c9':'#e5c07b');
-       g.fillRect(xx,Y+Ht-hh-3,bw*0.72,hh);
-       g.fillStyle='#cbd5e1';g.font='10px system-ui';
-       if(v>0.001)g.fillText((100*v).toFixed(v<0.095?1:0)+'%',xx,Y+Ht-hh-7);
-       g.fillStyle='#8b98ac';g.fillText(lbl[q],xx+bw*0.12,Y+Ht+13);}
-     g.fillStyle='#e879c9';g.font='10px system-ui';g.fillText('pre-cursor',X+Wd-150,Y+12);
-     g.fillStyle='#e5c07b';g.fillText('post-cursor',X+Wd-80,Y+12);
-     const preS=taps[0]+taps[1]+taps[2],postS=taps[4]+taps[5]+taps[6];
-     g.fillStyle='#8b98ac';g.fillText('pre '+(100*preS).toFixed(1)+'%   post '+(100*postS).toFixed(1)+'%   beyond \u00b13 UI '+(100*resid).toFixed(1)+'%   (of total pulse energy)',X,Y+Ht+26);}
-    document.getElementById('mfb').innerHTML=
-      met('modal spread',spreadPs.toFixed(spreadPs<10?2:1)+' ps ('+(spreadPs/L).toFixed(spreadPs/L<1?3:1)+' ps/m)')+
-      met('modal rms',rmsPs.toFixed(rmsPs<10?2:1)+' ps')+
-      met('modal 3dB BW',(bw3<1?(bw3*1000).toFixed(0)+' MHz':bw3.toFixed(2)+' GHz')+' @'+L+'m')+
-      met('BW x length',(bw3*L).toFixed(1)+' GHz\u00b7m')+
-      met('guided modes',M1pol+' (1 pol., RP convention) / '+Mmodes+' both pol.   V = '+V.toFixed(1))+
-      met('vs step-index',(alpha>=90?'this IS step':((45.0/(spreadPs/L)).toFixed(1)+'x better')))+
-      met('spread @1 UI',(1000/Math.max(P.Rb,0.1)).toFixed(0)+' ps UI -> '+(spreadPs/(1000/Math.max(P.Rb,0.1))).toFixed(2)+' UI at '+P.Rb+' Gbaud')+met('what the link uses','the full h(t) kernel is convolved - spread and rms are descriptors only')+met('LP01 n_eff',md0?md0.neff.toFixed(5):'-')+met('LP'+mL+','+mM,(mdX?('n_eff '+mdX.neff.toFixed(5)):'not guided'))+met('power past NA','LP01 '+(r0?(r0.frac*100).toFixed(1):'-')+'%   LP'+mL+mM+' '+(rX?(rX.frac*100).toFixed(1)+'%':'-'));}
-  }};
-
-let cur='cdlp',_raf=0;
+const TABS={
+cdpk:{ctrls:()=>'<div class="sechd tx">LED &amp; driver</div>'+slider('Rb','Baud (Gbaud)',1,12,0.5)+slider('dlam','µLED Δλ FWHM (nm)',4,20,1)+slider('ER','ER (dB)',3,15,0.5)+slider('peak','TX pre-emph (dB)',0,12,0.5)+slider('peakCost','Peaking cost (dB ER / dB peak)',0.1,0.6,0.05)+slider('txsnr','Tx Electrical Pattern SNR (dB)',20,60,1)+slider('pLed','LED optical OMA per lane (µW)',10,300,5)+'<div class="sechd opt">Lens &amp; fibre</div>'+slider('linkNA','Bundle NA',0.05,0.5,0.01)+slider('fbAlpha','Fibre profile alpha (2 = graded, 99 = step)',1.5,99,0.05)+slider('th50','Launch far-field half-angle at 50% (deg; 90 = overfilled)',2,90,0.5)+slider('Dcd','CD @430nm (ps/nm·km)',300,600,10)+slider('reach','Reach (m)',0,100,2)+slider('fibAtt','Fibre attenuation @430nm (dB/m)',0,0.3,0.01)+'<div class="sechd opt">Collection</div>'+slider('pdD','PD diameter (µm)',8,50,1)+slider('lensD','Lens pitch, fibre core matches it (µm)',10,60,1)+slider('zStand','PD standoff (µm)',10,40,1)+slider('dtiH','DTI height (µm)',0,15,1)+slider('dtiRefl','DTI reflectivity (%)',0,95,5)+slider('nbr','Neighbour lanes',1,6,1)+slider('rxDet','RX detector: 0 = single PIN, 1 = dual PIN differential, 2 = APD',0,2,1)+slider('thrOpt','Slicer threshold: 0 = mid-point, 1 = optimum for the two rails',0,1,1)+(_rxIsDual()?slider('pdGap2','Gap between the two PDs (µm)',2,12,1)+slider('cmFrac','Crosstalk common-mode fraction',0,1,0.05)+slider('cmrr','Differential front-end CMRR (dB)',0,40,1):'')+'<div class="sechd rx">Receiver</div>'+slider('prxAuto','P at RX: 1 = computed, 0 = manual',0,1,1)+(P.prxAuto?'':slider('Prx','P at RX (dBm)',-24,-4,0.5))+slider('rxBW','RX BW (GHz)',2,15,0.5)+slider('irn','TIA noise floor (pA/\u221aHz, flat part)',0.5,12,0.1)+slider('irnFc','TIA capacitive corner (GHz)',1,10,0.1)+slider('dfe1','RX DFE feedback (% of fitted h1)',0,100,5)+slider('lutRx','RX LUT strength (% of main cursor, 0 = off)',0,100,1)+(P.lutRx>0?slider('lutWx','LUT window: neighbours each side (1=4 rows, 2=16, 3=64, 4=256, 5=1024)',1,5,1):''),
+    render(){const el=view();if(!el._init){el.innerHTML='';el._eye=mkCanvas('cey',176);el._br=mkCanvas('cbr',196);el._cur=mkCanvas('ccur',168);el.append(el._eye,el._br,el._cur);el.insertAdjacentHTML('beforeend','<div class="metrics" id="mcd"></div><p class="note">'+CDNOTE+'</p>');el._init=1;}
+      const Rb=P.Rb,dlam=P.dlam,ledBW=_ledBWeff(),Dcd=P.Dcd,reach=P.reach,ERdb=P.ER,snr=P.snr;
+      const gdb=P.peak,g=Math.pow(10,gdb/20)-1;
+      const omaLossDB=P.peakCost*gdb,penDB=omaLossDB,pen=Math.pow(10,-penDB/20),erEff=Math.max(0.5,ERdb-penDB),erPenC=penDB,midL=(1+Math.pow(10,-ERdb/10))/2;
+      const dtau=Dcd*(reach/1000)*dlam, UI=1000/Rb, stau=dtau/2.355/1000;
+      const Hled=f=>1/Math.sqrt(1+Math.pow(f/Math.max(ledBW,0.3),2));
+      const Hcd=f=>Math.exp(-2*Math.PI*Math.PI*f*f*stau*stau);
+      const slp=0.4/Rb, Hlp=f=>Math.exp(-2*Math.PI*Math.PI*f*f*slp*slp), Hctle=f=>1+g*(1-Hlp(f));
+      const sinc=f=>{if(f===0)return 1;const x=Math.PI*f/Rb;return Math.abs(Math.sin(x)/x);};
+      const _mts=P.linkNA*P.linkNA*Math.max(reach,0)/(2*1.52*299792458);const Hmod=f=>{if(_mts<=0)return 1;const x=Math.PI*f*1e9*_mts;return x<1e-9?1:Math.abs(Math.sin(x)/x);};
+      // ---- spectrum (analytic Tx signal spectrum) ----
+      // ---- eye (dense) ----
+      const sps=12,Nsym=1200,rng=mulberry(77);
+      const bits=new Float64Array(Nsym);for(let i=0;i<Nsym;i++)bits[i]=(rng()<0.5)?0:1;
+      const P0=1/Math.pow(10,ERdb/10),P1=1;
+      const nrz=new Float64Array(Nsym*sps);for(let i=0;i<Nsym;i++){const v=bits[i]>0.5?P1:P0;for(let j=0;j<sps;j++)nrz[i*sps+j]=v;}
+      const gk=sig=>{const s=Math.max(sig,0.01),K=Math.ceil(4*s),k=new Float64Array(2*K+1);let sm=0;for(let i=-K;i<=K;i++){const v=Math.exp(-i*i/(2*s*s));k[i+K]=v;sm+=v;}for(let i=0;i<k.length;i++)k[i]/=sm;return k;};
+      const conv=(x,k)=>{const K=(k.length-1)/2,y=new Float64Array(x.length);for(let n=0;n<x.length;n++){let a=0;for(let m=-K;m<=K;m++){const idx=n-m;if(idx>=0&&idx<x.length)a+=x[idx]*k[m+K];}y[n]=a;}return y;};
+      const kled=gk(0.18*(Rb/Math.max(ledBW,0.5))*sps), klp=gk(sps*0.4);const _dtk=2*Math.PI*(8*ledBW)/(Rb*sps),_asym=Math.max(ledBW/bwOfJ(jOfBw(ledBW)/Math.pow(10,P.ER/10)),1),_aR=1-Math.exp(-_dtk*Math.sqrt(_asym)),_aF=1-Math.exp(-_dtk/Math.sqrt(_asym));const _tf=Math.max(0,Math.min(0.9,P.ledTail||0)),_aT=1-Math.exp(-(1000/(Rb*sps))/Math.max(5,(P.ledTailPs||250)));/*tail tau fixed in ps; was 1 UI through v340*/const ledResp=x=>{const y=new Float64Array(x.length);let st=x.length?x[0]:0,sl=st;for(let n=0;n<x.length;n++){const a=(x[n]>st)?_aR:_aF;st=st+(x[n]-st)*a;const at=(x[n]>sl)?_aR:_aT;sl=sl+(x[n]-sl)*at;y[n]=(1-_tf)*st+_tf*sl;}return y;};
+      const cdKernel=r=>gk(Math.max((Dcd*(r/1000)*dlam*Rb/1000)*sps/2.355,0.01));
+      const ctle=x=>{const lp=conv(x,klp),y=new Float64Array(x.length);for(let i=0;i<x.length;i++)y[i]=x[i]+g*(x[i]-lp[i]);return y;};
+      const krx=gk(0.18*(Rb/Math.max(P.rxBW,0.5))*sps);const _txN=Math.pow(10,-40/20)*Math.max(P1-P0,1e-6);const _addN=x=>{const y=new Float64Array(x.length);for(let i=0;i<y.length;i++)y[i]=x[i]+_txN*randn(rng);return y;};const modalK=r=>_modalKernel(P.linkNA,(P.fbAlpha===undefined?99:P.fbAlpha),(P.th50===undefined?5.5:P.th50),Math.max(r,0),Rb,sps);const _rxCh=(x,r)=>{let y=conv(ledResp(x),cdKernel(r));const mk=modalK(r);if(mk)y=conv(y,mk);return conv(y,krx);};const _nrzN=_addN(nrz);const sigCd=_rxCh(_nrzN,reach),sigEq=_rxCh(ctle(_nrzN),reach),ledN=sigCd;
+      /* 1-tap RX DFE helper (tau 0.15UI, center sampled, actual decisions, h1 refit on the given signal) */
+      const _dfeRun=(sg,tapPct)=>{const _hf=sps>>1;let _dmh=0,_dch=0,_dml=0,_dcl=0;
+        for(let i=41;i<Nsym-2;i++){const v=sg[i*sps+_hf];if(bits[i]>0.5){_dmh+=v;_dch++;}else{_dml+=v;_dcl++;}}
+        _dmh/=_dch;_dml/=_dcl;let _da=0,_dn1=0,_db=0,_dn0=0;
+        for(let i=41;i<Nsym-2;i++){const d=sg[i*sps+_hf]-(bits[i]>0.5?_dmh:_dml);if(bits[i-1]>0.5){_da+=d;_dn1++;}else{_db+=d;_dn0++;}}
+        const _dh1=0.5*(_da/_dn1-_db/_dn0)*(tapPct/100),_dth=(_dmh+_dml)/2;
+        const _dout=new Float64Array(sg.length);_dout.set(sg);
+        const _dal=1-Math.exp(-1/(0.15*sps));let _dpv=bits[40]>0.5?1:0,_dfb=0;
+        for(let i=41;i<Nsym-2;i++){const _dtg=_dpv?_dh1:-_dh1;for(let j=0;j<sps;j++){_dfb=_dfb+(_dtg-_dfb)*_dal;_dout[i*sps+j]=sg[i*sps+j]-_dfb;}_dpv=_dout[i*sps+_hf]>_dth?1:0;}
+        return _dout;};
+      /* 4-row RX LUT: the threshold offset is chosen by {previous decision, tentative next
+         decision}. Strength is an average |pre|,|post| tap in % of the main cursor, the
+         same convention the Dispersion-compensation tab uses. */
+      const _lutRun=(sg,tapPct)=>{
+        const _hf=sps>>1,I0=41,I1=Nsym-2;
+        let mh=0,ml=0,nh=0,nl=0;
+        for(let i=I0;i<I1;i++){const v=sg[i*sps+_hf];if(bits[i]>0.5){mh+=v;nh++;}else{ml+=v;nl++;}}
+        mh/=nh;ml/=nl;const amp=mh-ml,thr=(mh+ml)/2;
+        const co=k=>{let a=0,b=0,na=0,nb=0;
+          for(let i=I0;i<I1;i++){const j=i+k;if(j<0||j>=Nsym)continue;
+            const d=sg[i*sps+_hf]-(bits[i]>0.5?mh:ml);
+            if(bits[j]>0.5){a+=d;na++;}else{b+=d;nb++;}}
+          return (na&&nb)?(((a/na)-(b/nb))/amp):0;};
+        const fitAvg=50*(Math.abs(co(-1))+Math.abs(co(1)));
+        const scale=(fitAvg>1e-6)?(tapPct/fitAvg):0;
+        /* window widened for experiments: 5 neighbours each side is 1024 rows, which needs a lot of
+     data to adapt - the sim happily builds it, but a real LUT would take a long pattern to fill */
+    const W=Math.max(1,Math.min(5,Math.round(P.lutWx||1))), NR=1<<(2*W);
+        const dt=new Uint8Array(Nsym);
+        for(let i=0;i<Nsym;i++)dt[i]=(sg[i*sps+_hf]>thr)?1:0;
+        const addr=(i,dcur)=>{let a=0;
+          for(let q=W;q>=1;q--)a=(a<<1)|((i-q>=0)?(dcur?dcur[i-q]:dt[i-q]):0);
+          for(let q=1;q<=W;q++)a=(a<<1)|((i+q<Nsym)?dt[i+q]:0);
+          return a;};
+        const acc=new Float64Array(NR),cnt=new Float64Array(NR);
+        for(let i=I0;i<I1;i++){const k=addr(i,null);
+          acc[k]+=sg[i*sps+_hf]-(bits[i]>0.5?mh:ml);cnt[k]++;}
+        const C=new Float64Array(NR);
+        for(let k=0;k<NR;k++)C[k]=cnt[k]?acc[k]/cnt[k]*scale:0;
+        const out=new Float64Array(sg.length);out.set(sg);
+        const d=new Uint8Array(Nsym);for(let i=0;i<I0;i++)d[i]=dt[i];
+        for(let i=I0;i<I1;i++){const off=C[addr(i,d)];
+          for(let j=0;j<sps;j++)out[i*sps+j]=sg[i*sps+j]-off;
+          d[i]=(out[i*sps+_hf]>thr)?1:0;}
+        return out;};
+      const _afterDfe=(P.dfe1>0)?_dfeRun(sigEq,P.dfe1):sigEq;
+      let sigShow=(P.lutRx>0)?_lutRun(_afterDfe,P.lutRx):_afterDfe;
+      const _fNy=P.Rb/2*1e9,_fcIRN=(P.irnFc||12)*1e9,_gpk=0;/* TX pre-emph noise-free: noise depends on rxBW only, not peak */const _psd=ff=>1+Math.pow(ff/_fcIRN,2),_Hrx=ff=>1/Math.sqrt(1+Math.pow(ff/(P.rxBW*1e9),4)),_Hct=ff=>1+_gpk*(ff/_fNy)/Math.sqrt(1+Math.pow(ff/_fNy,2));let _bw=0;const _fmx=8*_fNy,_df=_fmx/300;for(let ff=_df/2;ff<_fmx;ff+=_df){_bw+=_psd(ff)*Math.pow(_Hrx(ff),2)*_df;}const _ob=_optBudget();const _prxUse=(P.prxAuto?_ob.prx:P.Prx);
+      const _Popt=Math.pow(10,_prxUse/10)*1e-3,_P0=Math.pow(10,-ERdb/10);const _sigTh=(P.irn*1e-12*Math.sqrt(_bw))*(1+_P0)/(2*P.R*_Popt);
+      const _xr=_xtResidual();const _sigXt=_xr.amp*(1-_P0)/2;
+      /* An APD multiplies the photocurrent by M before the TIA, so the thermal term shrinks by M
+   relative to the signal. Its own shot noise is multiplied by M^(1+x/2) through the excess
+   noise factor F = M^x, x about 0.3 for silicon at 430 nm where the avalanche is electron
+   initiated. Past M of about 4 the shot term catches the thermal one and the gain stops paying. */
+      const _M=_rxGain();
+      const _qe=1.602e-19;
+      const _Ipd=P.R*_Popt;
+      /* shot noise is white, so it must not use the TIA's f-squared weighted bandwidth */
+      let _bwW=0;for(let ff=_df/2;ff<_fmx;ff+=_df){_bwW+=Math.pow(_Hrx(ff),2)*_df;}
+      const _shot0=Math.sqrt(2*_qe*Math.max(_Ipd,1e-12)*Math.max(_bwW,1))/(2*P.R*_Popt);
+      const _shotM=_shot0*Math.pow(_M,1+APD_X/2);
+      const _sigThM=_sigTh/_M;
+      const sigma=Math.sqrt(_sigThM*_sigThM+_sigXt*_sigXt+_shotM*_shotM);
+      const ec=el._eye.getContext('2d');clear(ec,el._eye);ec.fillStyle='#cbd5e1';ec.font='12px system-ui';ec.fillText('Eye after RX ('+gdb.toFixed(1)+' dB)'+(P.dfe1>0?' + DFE '+P.dfe1+'%':'')+(P.lutRx>0?' + LUT '+P.lutRx+'%':'')+', eff ER '+erEff.toFixed(1)+' dB (set '+ERdb+')',12,15);
+      const pe={l:48,r:12,t:22,b:22},ew=el._eye._w-pe.l-pe.r,eh=el._eye._h-pe.t-pe.b;
+      ec.strokeStyle='#274060';ec.strokeRect(pe.l,pe.t,ew,eh);
+      /* fixed Y scale: anchored to nominal rails P0/P1 (28% headroom), NOT to per-render signal min/max - sliders no longer rescale the frame */const _sw=Math.max(1-P0,1e-6),ymin=P0-0.28*_sw,ymax=1+0.28*_sw;
+      ec.strokeStyle='#274060';ec.setLineDash([3,3]);for(const uu of[0.5,1,1.5]){const gx=pe.l+(uu/2)*ew;ec.beginPath();ec.moveTo(gx,pe.t);ec.lineTo(gx,pe.t+eh);ec.stroke();}ec.setLineDash([]);
+      /* eye: ADDITIVE density (count of traces per pixel, linear - no alpha saturation), drawn as vector lineTo into offscreen with 'lighter' blend, then gaussian blur (sigma 1.6px), normalize to p99, gamma 1.5 -> JET (blue few .. red only at true peaks), bilinear upscale. Matches OEM/PAM4 look. */
+      const _sTXd=(P1-P0)*Math.pow(10,-P.txsnr/20),_ns=Math.sqrt(sigma*sigma+_sTXd*_sTXd);
+      const _OW=Math.round(ew),_OH=Math.round(eh),_oc=document.createElement('canvas');_oc.width=_OW;_oc.height=_OH;const _o=_oc.getContext('2d');
+      _o.fillStyle='#000';_o.fillRect(0,0,_OW,_OH);_o.globalCompositeOperation='lighter';_o.strokeStyle='rgb(3,3,3)';_o.lineWidth=1;_o.lineJoin='round';_o.lineCap='round';
+      const _eyeStep=Math.max(1,Math.ceil((Nsym-18)/600));for(let i=16;i<Nsym-2;i+=_eyeStep){_o.beginPath();let first=true;for(let j=0;j<=2*sps;j++){const idx=i*sps-sps+j;if(idx<0||idx>=sigShow.length)continue;const v=midL+(sigShow[idx]-midL)*pen+_ns*randn(rng);const X=(j/(2*sps))*_OW,Y=(1-(v-ymin)/(ymax-ymin))*_OH;if(first){_o.moveTo(X,Y);first=false;}else _o.lineTo(X,Y);}_o.stroke();}
+      _o.globalCompositeOperation='source-over';
+      const _im=_o.getImageData(0,0,_OW,_OH),_px=_im.data,_N=_OW*_OH,_dn=new Float32Array(_N);for(let k=0;k<_N;k++)_dn[k]=_px[k*4];
+      /* separable gaussian blur sigma~1.6px (radius 4) for soft bands like OEM */
+      const _gk=[],_gr=4;let _gs=0;for(let q=-_gr;q<=_gr;q++){const w=Math.exp(-q*q/(2*1.6*1.6));_gk.push(w);_gs+=w;}for(let q=0;q<_gk.length;q++)_gk[q]/=_gs;
+      const _t1=new Float32Array(_N),_bl=new Float32Array(_N);
+      for(let y=0;y<_OH;y++)for(let x=0;x<_OW;x++){let sm=0;for(let q=-_gr;q<=_gr;q++){const xx=Math.min(_OW-1,Math.max(0,x+q));sm+=_dn[y*_OW+xx]*_gk[q+_gr];}_t1[y*_OW+x]=sm;}
+      for(let y=0;y<_OH;y++)for(let x=0;x<_OW;x++){let sm=0;for(let q=-_gr;q<=_gr;q++){const yy=Math.min(_OH-1,Math.max(0,y+q));sm+=_t1[yy*_OW+x]*_gk[q+_gr];}_bl[y*_OW+x]=sm;}
+      const _lit=[];for(let k=0;k<_N;k++)if(_bl[k]>0.5)_lit.push(_bl[k]);_lit.sort((a,b)=>a-b);const _nrm=_lit.length?_lit[Math.floor(_lit.length*0.99)]:1;
+      for(let k=0;k<_N;k++){const o=k*4,t=Math.min(1,_bl[k]/_nrm);if(t<0.02){_px[o]=8;_px[o+1]=12;_px[o+2]=40;_px[o+3]=255;continue;}const c=heatRGB(Math.pow(t,1.5));_px[o]=c[0];_px[o+1]=c[1];_px[o+2]=c[2];_px[o+3]=255;}
+      _o.putImageData(_im,0,0);ec.imageSmoothingEnabled=true;ec.drawImage(_oc,pe.l,pe.t,ew,eh);
+      ec.fillStyle='#66748e';ec.font='9px system-ui';ec.fillText('1 UI',pe.l+ew/2-7,pe.t+eh+10);
+      ec.fillText(ymax.toFixed(2),pe.l-30,pe.t+5);ec.fillText(ymin.toFixed(2),pe.l-30,pe.t+eh+3);
+      ec.strokeStyle='#274060';ec.beginPath();ec.moveTo(pe.l-3,pe.t);ec.lineTo(pe.l,pe.t);ec.moveTo(pe.l-3,pe.t+eh);ec.lineTo(pe.l,pe.t+eh);ec.stroke();
+      ec.save();ec.translate(13,pe.t+eh/2);ec.rotate(-Math.PI/2);ec.textAlign='center';ec.fillText('intensity (norm)',0,0);ec.restore();ec.textAlign='left';
+      // ---- BER vs reach ----
+      const Qeye=s=>{const hi=[],lo=[];for(let i=40;i<Nsym-2;i++){const v=s[i*sps+(sps>>1)];(bits[i]>0.5?hi:lo).push(v);}hi.sort((a,b)=>a-b);lo.sort((a,b)=>a-b);const eo=hi[Math.floor(hi.length*0.1)]-lo[Math.floor(lo.length*0.9)];const _mh=hi.reduce((a,b)=>a+b,0)/hi.length,_ml=lo.reduce((a,b)=>a+b,0)/lo.length;const _sh=Math.sqrt(hi.reduce((a,b)=>a+(b-_mh)*(b-_mh),0)/hi.length),_sl=Math.sqrt(lo.reduce((a,b)=>a+(b-_ml)*(b-_ml),0)/lo.length);const _sISI=0.11*(_sh+_sl);const _sTX=(P1-P0)*Math.pow(10,-P.txsnr/20);/* The two rails do not have the same spread: the LED's slow low level widens the zero rail.
+     A mid-point threshold is set by whichever rail is worse, while the optimum threshold balances
+     the two tails. Taking the ratio of the two, everything common cancels and the gain is just
+     2*max(s1,s0)/(s1+s0) - unity for equal rails, up to 2 when one rail dominates. Applying it as
+     a factor keeps the rest of the eye model, and its calibration, untouched. */
+  const _sX=Math.sqrt(sigma*sigma+_sTX*_sTX);
+  const _s1=Math.sqrt(_sh*_sh+_sX*_sX), _s0=Math.sqrt(_sl*_sl+_sX*_sX);
+  const _thrG=P.thrOpt?(2*Math.max(_s1,_s0)/(_s1+_s0+1e-12)):1;
+  return _thrG*Math.max(eo,1e-4)/(2*Math.sqrt(sigma*sigma+_sISI*_sISI+_sTX*_sTX)+1e-9);};if(P._cdOptReq){P._cdOptReq=0;const _gOf=pk=>Math.pow(10,pk/20)-1;const _ctleG=(x,gg)=>{const lp=conv(x,klp),y=new Float64Array(x.length);for(let i=0;i<x.length;i++)y[i]=x[i]+gg*(x[i]-lp[i]);return y;};const _reachOf=pk=>{const gg=_gOf(pk),penP=Math.pow(10,-P.peakCost*pk/20);let mr=-1;for(let r=0;r<=100;r+=2){const _n=_addN(nrz);if(berNRZ(Qeye(_rxCh(_ctleG(_n,gg),r))*penP)<1e-7)mr=r;else break;}return mr;};let _bP=0,_bR=-1;for(let pk=0;pk<=12;pk+=0.5){const _rr=_reachOf(pk);if(_rr>_bR+0.01){_bR=_rr;_bP=pk;}}P.peak=_bP;build();return;}
+      const dN=[],dP=[],dD=[],_dtap=(P.dfe1>0?P.dfe1:100);
+      /* sigma is computed once at P.reach, but the received power falls along the sweep,
+         so scale Q by the extra fibre loss at each r (only when Prx is being computed) */
+      const _qScale=r=>(P.prxAuto?Math.pow(10,-Math.max(P.fibAtt,0)*(r-Math.max(P.reach,0))/10):1);
+      for(let r=0;r<=100;r+=10){const _n=_addN(nrz);const _qs=_qScale(r);
+        dN.push([r,Math.max(berNRZ(Qeye(_rxCh(_n,r))*_qs),1e-13)]);
+        const _sq=_rxCh(ctle(_n),r);
+        dP.push([r,Math.max(berNRZ(Qeye(_sq)*pen*_qs),1e-13)]);
+        const _sd=_dfeRun(_sq,_dtap);dD.push([r,Math.max(berNRZ(Qeye(P.lutRx>0?_lutRun(_sd,P.lutRx):_sd)*pen*_qs),1e-13)]);}
+      {/* ---- ISI taps of the signal actually reaching the slicer ---- */
+       const g=el._cur.getContext('2d');clear(g,el._cur);
+       const W=el._cur._w,H=el._cur._h;
+       const vv=sigShow, HF=sps>>1, I0=41, I1=Nsym-3;
+       let mh=0,ml=0,nh=0,nl=0;
+       for(let i=I0;i<I1;i++){const x=vv[i*sps+HF];if(bits[i]>0.5){mh+=x;nh++;}else{ml+=x;nl++;}}
+       mh/=nh;ml/=nl;const amp=mh-ml;
+       const co=k=>{let a=0,b=0,na=0,nb=0;
+         for(let i=I0;i<I1;i++){const j=i+k;if(j<0||j>=Nsym)continue;
+           const d=vv[i*sps+HF]-(bits[i]>0.5?mh:ml);
+           if(bits[j]>0.5){a+=d;na++;}else{b+=d;nb++;}}
+         return (na&&nb)?(((a/na)-(b/nb))/amp):0;};
+       /* k<0 correlates with an EARLIER symbol -> post-cursor */
+       const ks=[2,1,0,-1,-2,-3], lbl=['h-2','h-1','h+0','h+1','h+2','h+3'];
+       const hv=ks.map(k=>k===0?1:Math.abs(co(k)));
+       g.fillStyle='#8bb7f0';g.font='bold 12px system-ui';
+       g.fillText('ISI taps at the decision point (after EQ)',12,16);
+       const X=46,Y=30,Wd=W-90,Ht=H-74,bw=Wd/7;
+       g.strokeStyle='#25324e';g.strokeRect(X,Y,Wd,Ht);
+       for(let q=0;q<ks.length;q++){
+         const v=Math.min(hv[q],1),xx=X+(q+0.6)*bw,h=v*(Ht-22);
+         g.fillStyle=(ks[q]===0)?'#3fb950':(q<2?'#e5c07b':'#86b7f0');
+         g.fillRect(xx,Y+Ht-2-h,bw*0.6,h);
+         g.font='9px system-ui';
+         g.fillText((100*hv[q]).toFixed(1)+'%',xx-2,Y+Ht-6-h);
+         g.fillStyle='#8b98ac';g.fillText(lbl[q],xx+bw*0.1,Y+Ht+13);}
+       g.fillStyle='#e5c07b';g.font='9px system-ui';g.fillText('pre-cursor',X+6,Y+Ht+27);
+       g.fillStyle='#3fb950';g.fillText('the bit itself',X+2.1*bw,Y+Ht+27);
+       g.fillStyle='#86b7f0';g.fillText('post-cursor',X+3.4*bw,Y+Ht+27);
+       g.fillStyle='#66748c';g.fillText('sum of side taps / main = '+(hv[0]+hv[1]+hv[3]+hv[4]+hv[5]).toFixed(2),X+5.0*bw,Y+Ht+27);}
+      globalThis._cdCurve={dN:dN,dP:dP,dD:dD};
+      const bp={l:46,r:120,t:20,b:34},bc=el._br.getContext('2d');clear(bc,el._br);
+      axes(bc,el._br,bp,'Reach (m)','BER','BER vs reach');
+      linePlot(bc,el._br,[{d:dN,c:'#8b98ac',name:'no EQ'},{d:dD,c:'#3fb950',name:'with EQ (peaking '+gdb.toFixed(1)+' dB + DFE '+_dtap+'%'+(P.lutRx>0?' + LUT '+P.lutRx+'%':'')+')'}],[0,80],[1e-12,1],bp,true);
+      const bpw=el._br._w-bp.l-bp.r,bph=el._br._h-bp.t-bp.b,yF=bp.t+(1-(-7+12)/12)*bph;
+      bc.strokeStyle='#c678dd';bc.setLineDash([5,4]);bc.beginPath();bc.moveTo(bp.l,yF);bc.lineTo(bp.l+bpw,yF);bc.stroke();bc.setLineDash([]);bc.strokeStyle='#c678dd';bc.setLineDash([4,3]);bc.beginPath();bc.moveTo(bp.l+bpw+6,yF);bc.lineTo(bp.l+bpw+15,yF);bc.stroke();bc.setLineDash([]);bc.fillStyle='#c678dd';bc.font='9px system-ui';bc.fillText('ECC 1e-7',bp.l+bpw+18,yF+3);
+      if(!el._br._tipInit){el._br._tipInit=1;el._br.addEventListener('mousemove',ev=>{const rc=el._br.getBoundingClientRect();el._br._mx=(ev.clientX-rc.left)/rc.width*el._br._w;schedule();});el._br.addEventListener('mouseleave',()=>{el._br._mx=null;schedule();});}
+      if(el._br._mx!=null&&el._br._mx>=bp.l&&el._br._mx<=bp.l+bpw){const mx=el._br._mx,reach=(mx-bp.l)/bpw*80;const itp=d=>{for(let k=1;k<d.length;k++){if(d[k][0]>=reach){const t=(reach-d[k-1][0])/((d[k][0]-d[k-1][0])||1);return Math.pow(10,Math.log10(d[k-1][1])*(1-t)+Math.log10(d[k][1])*t);}}return d[d.length-1][1];};const bN=itp(dN),bP=itp(dP);bc.strokeStyle='#8b98ac';bc.setLineDash([2,2]);bc.beginPath();bc.moveTo(mx,bp.t);bc.lineTo(mx,bp.t+bph);bc.stroke();bc.setLineDash([]);const tx=mx>bp.l+bpw-98?mx-94:mx+6;bc.fillStyle='#0d1117';bc.fillRect(tx,bp.t+3,90,40);bc.strokeStyle='#30363d';bc.strokeRect(tx,bp.t+3,90,40);bc.fillStyle='#e5c07b';bc.font='10px system-ui';bc.fillText('reach '+reach.toFixed(1)+'m',tx+5,bp.t+15);bc.fillStyle='#8b98ac';bc.fillText('no-pk '+fmtber(bN),tx+5,bp.t+27);bc.fillStyle='#58a6ff';bc.fillText('peak '+fmtber(bP),tx+5,bp.t+39);}
+      // ---- metrics ----
+      {const _b=_isiBudget();
+      document.getElementById('mcd').innerHTML=met('BER @reach',fmtber(berNRZ(Qeye(sigCd)))+' → '+fmtber(berNRZ(Qeye(sigShow)*pen))+' (with EQ)')+met('total ISI',_b.tot.ui.toFixed(3)+' UI  ('+_b.tot.rms.toFixed(0)+' ps rms)')+met('ISI split','LED '+_b.led.pct.toFixed(0)+'%   modal '+_b.mod.pct.toFixed(0)+'%   CD '+_b.cd.pct.toFixed(0)+'%')+met('eff ER',erEff.toFixed(1)+' dB (−'+erPenC.toFixed(1)+' ER)')+met('P at RX',_prxUse.toFixed(1)+' dBm'+(P.prxAuto?'  (computed)':'  (manual)'))+met('optical budget','OMA '+_ob.omaUW.toFixed(0)+' µW = '+_ob.pLedDBm.toFixed(1)+' dBm − '+_ob.launchdB.toFixed(1)+' TX coupling − '+_ob.fibdB.toFixed(1)+' fibre − '+_ob.collDB.toFixed(1)+' collection')+met('RX detector',['single PIN','dual PIN differential','APD, M = '+APD_M+', F = M^'+APD_X][P.rxDet|0])+met('IRN effective',(P.irn*Math.sqrt(1+Math.pow(P.rxBW,2)/(3*Math.pow(P.irnFc||2.82,2)))).toFixed(2)+' pA/\u221aHz over '+P.rxBW+' GHz  (floor '+P.irn+', corner '+(P.irnFc||12)+' GHz)')+met('LED 3dB BW',_ledBWeff().toFixed(2)+' GHz  (at '+_ledJ().toFixed(0)+' A/cm2, from the slide-16 curve)')+met('implied WPE',(100*_ob.omaUW/1000/4.4).toFixed(1)+'%  (against 1 mA at Vf 4.4 V, from the PTL L-I)')+met('TX coupling','core-fit '+_ob.spatialdB.toFixed(1)+' + NA-fit '+_ob.angulardB.toFixed(1)+' + lens '+_ob.capdB.toFixed(1)+' = '+_ob.launchdB.toFixed(1)+' dB')+met('crosstalk','optical '+_xr.xtOdB.toFixed(0)+' dB   electrical '+_xr.xtEraw.toFixed(0)+(_rxIsDual()?(' → '+_xr.xtEdB.toFixed(0)+' after CMRR'):'')+' dB   → total '+_xr.effDB.toFixed(0)+' dB')+met('detector geometry',_rxIsDual()?('2 detectors, each '+_ob.dEff.toFixed(0)+' µm'):('one detector, '+P.pdD+' µm'));}}}
+};
+let cur='cdpk',_raf=0;
 function view(){return document.getElementById('view');}
+function reqOpt(){P._optReq=1;schedule();}
 function schedule(){if(_raf)return;_raf=requestAnimationFrame(()=>{_raf=0;try{TABS[cur].render();}catch(e){view().innerHTML='<p style="color:#ef4444">Render error: '+e.message+'</p>';}});}
+var CAPTURE_RX=0.90;
+function optRX(reflP,nbr,thresh,pitch){var z=P.zStand,lg=P.lensGap,Dref=50,s12=Math.sin(12*Math.PI/180),refl=reflP/100,best=null;var fCore=pitch||_coreD();for(var pd=8;pd<=50;pd+=2){for(var gap=2;gap<=12;gap+=2){var minL=Math.max(25,2*pd+gap);if(pitch){if(2*pd+gap>pitch)continue;}else if(minL>50)continue;var _lo=pitch||minL,_hi=pitch||50;for(var Del=_lo;Del<=_hi;Del+=1){var th=Math.asin(Math.min(0.99,Math.min(1,Dref/Del)*s12)),tanT=Math.tan(th),Dbeam=Del+2*z*tanT,bA=Math.PI*(Dbeam/2)*(Dbeam/2),p2=pd+gap;var f0=Math.min(1,(diskOverlap(Dbeam/2,pd/2,p2/2)+diskOverlap(Dbeam/2,pd/2,p2/2))/bA);var Dw=Math.min(Del,Dbeam),fw=Math.min(1,diskOverlap(Dbeam/2,Dw/2,0)/bA);for(var h=0;h<=Math.min(15,z);h+=1){var fill=Math.min(1,CAPTURE_RX*Math.min(1,(Del/fCore)*(Del/fCore))*(f0+Math.max(0,fw-f0)*refl*Math.min(1,h/z)));var g=(diskOverlap(Dbeam/2,pd/2,Math.abs(Del+lg+p2/2))+diskOverlap(Dbeam/2,pd/2,Math.abs(Del+lg-p2/2)))/bA;var xt=Math.min(1,g*(1-refl*Math.min(1,h/z))*nbr),xtdB=10*Math.log10(Math.max(xt,1e-6));if(xtdB<thresh&&(!best||fill>best.fill))best={fill:fill,xtdB:xtdB,Del:Del,pd:pd,gap:gap,h:h};}}}}return best;}
+
+function optEllipse(reflP,nbr,thresh,pitch){var z=P.zStand,lg=P.lensGap,Dref=50,s12=Math.sin(12*Math.PI/180),refl=reflP/100,best=null;var fCore=pitch||_coreD();for(var pd=8;pd<=24;pd+=2){for(var gap=2;gap<=6;gap+=2){var minL=Math.max(25,2*pd+gap);if(pitch){if(2*pd+gap>pitch)continue;}else if(minL>50)continue;var _lo=pitch||minL,_hi=pitch||50;for(var Del=_lo;Del<=_hi;Del+=2){var th=Math.asin(Math.min(0.99,Math.min(1,Dref/Del)*s12)),tanT=Math.tan(th),Dbeam=Del+2*z*tanT,bA=Math.PI*(Dbeam/2)*(Dbeam/2),Rb=Dbeam/2,p2=pd+gap,aE=pd/2;for(var asp=1;asp<=4.001;asp+=0.5){var bE=aE*asp;if(bE>Rb)break;var f0=Math.min(1,(ovE(aE,bE,-p2/2,0,Rb,0,0)+ovE(aE,bE,p2/2,0,Rb,0,0))/bA);var g=(ovE(aE,bE,-p2/2,0,Rb,Del+lg,0)+ovE(aE,bE,p2/2,0,Rb,Del+lg,0))/bA;var Dw=Math.min(Del,Dbeam),fw=Math.min(1,diskOverlap(Dbeam/2,Dw/2,0)/bA);for(var h=0;h<=Math.min(15,z);h+=1){var fill=Math.min(1,CAPTURE_RX*Math.min(1,(Del/fCore)*(Del/fCore))*(f0+Math.max(0,fw-f0)*refl*Math.min(1,h/z)));var xt=Math.min(1,g*(1-refl*Math.min(1,h/z))*nbr),xtdB=10*Math.log10(Math.max(xt,1e-6));if(xtdB<thresh&&(!best||fill>best.fill))best={fill:fill,xtdB:xtdB,Del:Del,pd:pd,gap:gap,h:h,asp:asp};}}}}}return best;}
+function rxOptimize(pitch){var tsel=document.getElementById('sel_thr'),thresh=tsel?parseFloat(tsel.value):-40;var csel=document.getElementById('sel_cfg'),cfg=csel?csel.value:'2pd';var isL=(cfg==='ellip'),is2=(cfg==='2pd');var _sz=P.zStand,b=null,bZ=_sz;for(var _z=10;_z<=40;_z+=2){P.zStand=_z;var _b=isL?optEllipse(P.dtiRefl,P.nbr,thresh,pitch):is2?optRX(P.dtiRefl,P.nbr,thresh,pitch):optRX(P.dtiRefl,P.nbr,thresh,pitch);if(_b&&(!b||_b.fill>b.fill)){b=_b;bZ=_z;}}P.zStand=bZ;var r=document.getElementById('rxoptres');if(!b){P.zStand=_sz;if(r)r.textContent='no config meets '+thresh+' dB';return;}if(pitch){_coreD()=pitch;P.lensGap=0;}P.lensD=b.Del;P.pdD=b.pd;P.dtiH=b.h;if(is2||isL)P.pdGap=b.gap;if(isL)P.aspect=b.asp;build();var sc=document.getElementById('sel_cfg');if(sc)sc.value=cfg;schedule();var rr=document.getElementById('rxoptres');if(rr)rr.textContent=(pitch?'@'+pitch+'\u00b5m pitch  ':'')+'\u2192 lens '+b.Del+' / PD '+b.pd+((is2||isL)?' / gap '+b.gap:'')+(isL?' / asp '+b.asp:'')+' / DTI '+b.h+'\u00b5m / z '+bZ+'\u00b5m'+(P.lensGap>0?' | lens-gap '+P.lensGap+'\u00b5m':'')+'  \u21d2 fill '+(100*b.fill).toFixed(0)+'%, xt '+b.xtdB.toFixed(0)+'dB';}
 function build(){document.getElementById('ctrls').innerHTML='<h3>Controls</h3><div class="ctlgrid">'+TABS[cur].ctrls()+'</div>';
   document.querySelectorAll('input[type=range]').forEach(inp=>{const key=inp.id.slice(2);inp.addEventListener('input',()=>{P[key]=parseFloat(inp.value);const lab=document.getElementById('v_'+key);if(lab)lab.textContent=inp.value;schedule();});});
-  schedule();}
+  document.querySelectorAll('#ctrls select').forEach(sel=>sel.addEventListener('change',schedule));var _ob=document.getElementById('optbtn');if(_ob)_ob.addEventListener('click',function(){P._optReq=1;schedule();});var _r25=document.getElementById('rxopt25');if(_r25)_r25.addEventListener('click',function(){rxOptimize(25);});var _r50=document.getElementById('rxopt50');if(_r50)_r50.addEventListener('click',function(){rxOptimize(50);});schedule();}
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));t.classList.add('on');cur=t.dataset.t;view()._init=0;build();}));
+const pre=document.getElementById('preset');if(pre)pre.addEventListener('change',()=>{if(pre.value==='ekit26'){Object.assign(P,{Rb:3,ledSlow:0.35,dlam:16,ER:6.5,peak:0,peakCost:0.3,txsnr:40,linkNA:0.2,fbAlpha:99,th50:5.5,Dcd:450,fibAtt:0.06,pdD:30,lensD:50,zStand:30,dtiH:0,dtiRefl:55,fiberCore:50,ledArea:38,irn:5,irnFc:12,dfe1:0,lutRx:0,rxDet:0,pLed:57,reach:5,nbr:6,prxAuto:1,rxBW:3,rxDet:2});}else if(pre.value==='mosaic'){/* Calibrated (offline harness, Sep 2026) to MOSAIC SIGCOMM'25 Fig 12 anchors, no-EQ chain: 2G@10m 3e-12 (~error-free), 2G@20m 5.3e-7 (paper <1e-6), 1.6G@30m 2.9e-5 (meets FEC), 1.3G@20m 6e-13 (error-free), 2G@30m 7e-3 vs paper 'slightly above 2e-4' — known residual: this engine's reach slope past ~25m is steeper than their measured curve; pass/fail verdict at every Fig-12 point is reproduced. Prx manual (-19.75 dBm): prototype couples via discrete bulk lenses, not this sim's TIR geometry. rxBW 2 GHz per paper (CMOS sensor 1-2 GHz); dlam 20nm (large prototype uLEDs, paper: >10nm); Dcd 500 at ~450nm; th50 2.75deg / NA 0.18: underfilled launch after their TIR collimator, absorbs their analog-EQ benefit — see paper section 3.5. */Object.assign(P,{Rb:2,ledSlow:0.35,dlam:20,ER:6.5,peak:0,peakCost:0.3,txsnr:40,linkNA:0.18,fbAlpha:99,th50:2.75,Dcd:500,fibAtt:0.06,pdD:30,lensD:50,zStand:30,dtiH:0,dtiRefl:55,fiberCore:50,ledArea:38,irn:5,irnFc:12,dfe1:0,lutRx:0,rxDet:0,pLed:75,reach:20,nbr:1,prxAuto:0,Prx:-19.75,rxBW:2});}else if(pre.value==='hoti'){Object.assign(P,{Rb:4,ledSlow:0.35,dlam:10,ER:6.5,peak:0,peakCost:0.3,txsnr:40,pLed:110,linkNA:0.2,fbAlpha:2,th50:5.5,Dcd:450,reach:20,fibAtt:0.06,pdD:30,lensD:50,zStand:30,dtiH:0,dtiRefl:55,fiberCore:50,ledArea:38,nbr:1,prxAuto:0,Prx:-19.5,rxBW:3.4,irn:5,irnFc:12,dfe1:0,lutRx:0,rxDet:0});}view()._init=0;build();});
 build();
 </script>
 </body></html>
